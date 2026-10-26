@@ -9,7 +9,7 @@ Heart icon:  SVG 309 B  ->  mcuVG 67 B  ->  drawn at 24, 48, 112 px or turned, f
 ```
 
 > Status: **draft 1** (experimental). The format carries a version; files may still change before 1.0.
-> Born for the WOWCube 2.0 (Beken BK7258, Cortex-M33), meant for any MCU.
+> Built and measured on a Cortex-M33 (Beken BK7258); meant for any MCU.
 
 ## Why
 
