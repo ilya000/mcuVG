@@ -492,6 +492,14 @@ static inline __attribute__((always_inline)) uint32_t lut_at(const uint32_t *lut
     return lut[i];
 }
 
+/* 8-bit channels to RGB565, rounded to the nearest level (exactly (v * 31 + 127) / 255 and (v * 63 + 127) / 255):
+   truncating instead darkened every colour by up to 7 levels of 255 in red and blue, a hue drift in dark tones */
+static inline uint32_t rgb565(uint32_t r, uint32_t g, uint32_t b)
+{
+    return ((r * 249u + 1014u) >> 11) << 11 | ((g * 253u + 505u) >> 10) << 5 | ((b * 249u + 1014u) >> 11);
+}
+#define ARGB565(p) rgb565(((p) >> 16) & 255u, ((p) >> 8) & 255u, (p) & 255u)
+
 static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
 {
     int n = x1 - x0;
@@ -512,7 +520,7 @@ static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int 
         uint16_t *d = (uint16_t *)rowp + x0;
         int sw = c->fmt == MCUVG_RGB565_SWAP;
         if (flat && (f >> 24) == 255u) {                 /* opaque: the colour once, then stores only */
-            uint32_t o = ((f >> 8) & 0xF800u) | ((f >> 5) & 0x07E0u) | ((f >> 3) & 0x001Fu);
+            uint32_t o = ARGB565(f);
             uint16_t v = (uint16_t)(sw ? ((o & 255u) << 8) | (o >> 8) : o);
             for (int i = 0; i < n; i++) d[i] = v;
             return;
@@ -521,7 +529,7 @@ static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int 
             uint32_t s = flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv), sa = s >> 24, k = 255u - sa;
             if (!sa) continue;
             if (sa == 255u) {
-                uint32_t o = ((s >> 8) & 0xF800u) | ((s >> 5) & 0x07E0u) | ((s >> 3) & 0x001Fu);
+                uint32_t o = ARGB565(s);
                 d[i] = (uint16_t)(sw ? ((o & 255u) << 8) | (o >> 8) : o);
                 continue;
             }
@@ -532,7 +540,7 @@ static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int 
             r = ((s >> 16) & 255u) + (r * k + 127u) / 255u;
             g = ((s >> 8) & 255u) + (g * k + 127u) / 255u;
             b = (s & 255u) + (b * k + 127u) / 255u;
-            v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+            v = rgb565(r, g, b);
             d[i] = (uint16_t)(sw ? ((v & 255u) << 8) | (v >> 8) : v);
         }
         return;
@@ -599,7 +607,7 @@ static inline __attribute__((always_inline)) void fill565(uint16_t *d, int n, ui
         r = sr + (r * k + 127u) / 255u;
         g = sg + (g * k + 127u) / 255u;
         b = sb + (b * k + 127u) / 255u;
-        v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        v = rgb565(r, g, b);
         d[i] = (uint16_t)(sw ? ((v & 255u) << 8) | (v >> 8) : v);
     }
 }
@@ -739,7 +747,7 @@ static int raster(mcuvg_ctx *c, const struct pnt *q, int rule)
     sort_edges(c->e, c->ne);
     struct sweep r = { c->row, c->tb, (xb - xa + 2 + 31) >> 5, xb - xa, q->flat, 0, c->fmt == MCUVG_RGB565_SWAP,
                        c, q, lut_of(c), xa };
-    uint32_t o565 = ((r.fl >> 8) & 0xF800u) | ((r.fl >> 5) & 0x07E0u) | ((r.fl >> 3) & 0x001Fu);
+    uint32_t o565 = ARGB565(r.fl);
     r.v565 = r.sw ? ((o565 & 255u) << 8) | (o565 >> 8) : o565;
     const int f565 = q->kind == MCUVG_FLAT && (c->fmt == MCUVG_RGB565 || r.sw);
     const mcuvg_edge *E = c->e;
