@@ -69,10 +69,12 @@ static uint32_t take(struct bits *k, int n)
 int mcuvg_head(const void *data, uint32_t len, mcuvg_info *o)
 {
     struct rd r = { (const uint8_t *)data, 0, len, ~(uintptr_t)0, 0, 0 };
-    if (!data || len < 6u) return MCUVG_E_ARG;
+    if (!data || len < 7u) return MCUVG_E_ARG;
     if (u8(&r) != (uint32_t)MCUVG_MAGIC0 || u8(&r) != (uint32_t)MCUVG_MAGIC1) return MCUVG_E_ARG;
+    uint32_t ver = u8(&r);                            /* every version up to its own (SPEC.md 2.1) */
+    if (ver < 1u || ver > (uint32_t)MCUVG_VERSION) return MCUVG_E_ARG;
     uint32_t fl = u8(&r);
-    if (((fl >> 4) & 3u) != 1u || (fl & 0x80u)) return MCUVG_E_ARG;
+    if (fl & 0xB0u) return MCUVG_E_ARG;               /* bits 4, 5, 7 reserved */
     o->grid = (uint8_t)(fl & 15u);
     o->alpha = (uint8_t)((fl >> 6) & 1u);
     o->w = vu(&r);

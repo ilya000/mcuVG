@@ -13,6 +13,7 @@
 
 #define MCUVG_MAGIC0 'm'
 #define MCUVG_MAGIC1 'V'
+#define MCUVG_VERSION 1u   /* the newest format version this decoder reads (the header's third byte); it reads every older one */
 
 typedef struct {
     uint32_t w, h;          /* the design box, units */

@@ -14,7 +14,8 @@ outline of one path).
 
 Layout (little-endian, varuint = 7 bits a byte, low first; zvar = zig-zag varuint):
     'm' 'V'   (0x6D 0x56)
-    u8  bits 0..3 F (the grid: 1 / 2^F of a design unit), 4..5 version (1), 6 colours carry alpha
+    u8  version (1)
+    u8  bits 0..3 F (the grid: 1 / 2^F of a design unit), 6 colours carry alpha; 4, 5, 7 reserved (0)
     varuint width, height                      design units
     varuint ncolors, then ncolors x RGB or RGBA
     shapes until a kind byte 0:
@@ -41,6 +42,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import svgfront  # noqa: E402
 
+VERSION = 1   # the format version written (the lowest that holds the picture) and the newest one read
 CAPS = {"butt": 0, "round": 1, "square": 2}
 JOINS = {"miter": 0, "miter-clip": 0, "arcs": 0, "round": 1, "bevel": 2}
 CAP_N = {v: k for k, v in CAPS.items() if k in ("butt", "round", "square")}
@@ -332,7 +334,7 @@ class Enc:
                 body += self.path(simplify(s["segs"], self.tol))
             last = s["segs"]
         alpha = any(c[3] != 255 for c in self.colors)
-        head = b"mV" + bytes([self.F | 1 << 4 | (64 if alpha else 0)])
+        head = b"mV" + bytes([VERSION, self.F | (64 if alpha else 0)])
         head += varuint(int(math.ceil(self.doc.vb[2]))) + varuint(int(math.ceil(self.doc.vb[3])))
         head += varuint(len(self.colors)) + b"".join(bytes(c if alpha else c[:3]) for c in self.colors)
         return head + body + b"\x00"
@@ -377,9 +379,10 @@ def decode(b):
     """-> svgfront.Doc with the shapes (coordinates in design units)"""
     r = Rd(b)
     assert r.u8() == ord("m") and r.u8() == ord("V"), "not mcuVG"
+    assert 1 <= r.u8() <= VERSION, "a version this decoder does not read"
     fl = r.u8()
     F, alpha = fl & 15, fl & 64
-    assert (fl >> 4) & 3 == 1, "version"
+    assert not fl & 0xB0, "reserved bits"
     k = float(1 << F)
     d = svgfront.Doc()
     w, h = r.vu(), r.vu()

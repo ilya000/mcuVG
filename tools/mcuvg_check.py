@@ -69,7 +69,19 @@ def main():
                 junk[rnd.randrange(3, len(junk))] = rnd.randrange(256)
             lib.draw_mcuvg(bytes(junk), 64, 64, 0.25)
     print(f"cut pictures: {errs} of {total} prefixes refused (all must be); damaged pictures drawn without a crash")
-    sys.exit(1 if diff or errs != total else 0)
+    # the version byte (SPEC.md 2.1): this decoder reads 1 .. its own; a newer one, 0, or a reserved flag bit is refused
+    b = mcuvg.encode(svgfront.load(files[0]), a.px)
+    vbad = []
+    for what, i, v in (("version 0", 2, 0), ("version 2", 2, 2), ("version 255", 2, 255),
+                       ("flag bit 4", 3, b[3] | 0x10), ("flag bit 5", 3, b[3] | 0x20), ("flag bit 7", 3, b[3] | 0x80)):
+        x = bytearray(b)
+        x[i] = v
+        if lib.draw_mcuvg(bytes(x), 64, 64, 0.25)[1] == 0:
+            vbad.append(what)
+    ok = lib.draw_mcuvg(b, 64, 64, 0.25)[1] == 0
+    print(f"version byte: {'version 1 drawn' if ok else 'version 1 REFUSED'}, "
+          f"{'every newer version and reserved bit refused' if not vbad else 'ACCEPTED: ' + ', '.join(vbad)}")
+    sys.exit(1 if diff or errs != total or vbad or not ok else 0)
 
 
 if __name__ == "__main__":

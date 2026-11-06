@@ -1,7 +1,7 @@
 # mcuVG — MCU Vector Graphics, format specification
 
-**Draft 1, version field 1.** Status: experimental. The layout may still change before version 1.0; files carry their
-version, and a decoder refuses a version it does not know.
+**Draft 2, format version 1.** Status: experimental. The layout may still change before version 1.0. Every file carries
+its format version in a byte of its own (section 2.1).
 
 mcuVG is a compact binary format for vector pictures — icons, glyphs, UI shapes, flat illustrations — that a
 microcontroller draws straight from flash. Authors write SVG; a converter on a computer compiles it; the device only
@@ -25,11 +25,24 @@ decodes and rasterises.
 | Field | Size | Meaning |
 |---|---|---|
 | magic | 2 B | `'m' 'V'` (0x6D 0x56) |
-| flags | 1 B | bits 0–3: F; bits 4–5: version (1); bit 6: colours carry alpha; bit 7: 0 |
+| version | 1 B | the format version, 1 … 255; this document describes version 1 |
+| flags | 1 B | bits 0–3: F; bit 6: colours carry alpha; bits 4, 5, 7: 0 |
 | width | varuint | design box, units |
 | height | varuint | design box, units |
 | ncolors | varuint | colours in the table |
 | colors | 3 or 4 B each | R, G, B (and A when bit 6), sRGB, straight alpha |
+
+### 2.1. Versions
+
+The version byte names the layout of everything after it. A later version only adds to the format (new commands,
+paints, fields); a file that needs none of the additions stays at the version that already holds it.
+
+1. **A decoder reads every version up to its own.** A newer decoder never drops an older version: pictures already
+   made keep working.
+2. **An encoder writes the lowest version that holds the picture.** A picture that uses nothing added later is
+   written as the older version, so older decoders still draw it.
+
+A decoder refuses a version newer than its own, as it refuses any other picture it cannot read (section 6).
 
 ## 3. Shapes
 
@@ -97,7 +110,7 @@ An mcuVG picture is often carried inside source code, JSON (MCP tool calls) or L
 prefix `mcuvg:`:
 
 ```lua
-mcuvg.draw("mcuvg:bVYSgAKAAgEAAAABAAletWqrD/NI8SB48KD4pvBrZoFAWnhmb/im9+p4+B/wA/CA9//LeMCcpbSlPMBUy3jwgPCAAA==")
+mcuvg.draw("mcuvg:bVYBAoACgAIBAAAAAQAJXrVqqw/zSPEgePCg+Kbwa2aBQFp4Zm/4pvfqePgf8APwgPf/y3jAnKW0pTzAVMt48IDwgAA=")
 ```
 
 As a URI: `data:image/x-mcuvg;base64,…`. File extension: `.mcuvg`.

@@ -5,10 +5,12 @@ microcontrollers. Designers and AIs write SVG; a converter compiles it to a few 
 it straight from flash at any size and angle.
 
 ```
-Heart icon:  SVG 309 B  ->  mcuVG 67 B  ->  drawn at 24, 48, 112 px or turned, from the same bytes
+Heart icon:  SVG 309 B  ->  mcuVG 68 B  ->  drawn at 24, 48, 112 px or turned, from the same bytes
 ```
 
-> Status: **draft 1** (experimental). The format carries a version; files may still change before 1.0.
+> Status: **draft 2** (experimental). Every file carries its format version in a byte of its own; a decoder reads every
+> version up to its own, an encoder writes the lowest one that holds the picture (SPEC.md 2.1). The layout may still
+> change before 1.0.
 > Built and measured on a Cortex-M33 (Beken BK7258); meant for any MCU.
 
 ## Why
@@ -24,9 +26,9 @@ Heart icon:  SVG 309 B  ->  mcuVG 67 B  ->  drawn at 24, 48, 112 px or turned, f
 
 | Set | SVG | SVG + gzip | TinyVG | **mcuVG** |
 |---|---|---|---|---|
-| Phosphor regular (1512) | 522 B | 293 B | 211 B | **126 B** |
-| Phosphor fill (1512) | 470 B | 269 B | 183 B | **108 B** |
-| Tests: strokes, gradients, arcs, transforms (6) | 433 B | 247 B | 111 B | **89 B** |
+| Phosphor regular (1512) | 522 B | 293 B | 211 B | **127 B** |
+| Phosphor fill (1512) | 470 B | 269 B | 183 B | **109 B** |
+| Tests: strokes, gradients, arcs, transforms (6) | 433 B | 247 B | 111 B | **90 B** |
 
 Grid for display at 240 px, step ≤ 0.25 px. Reproduce with `tools/vg_sizes.py` (`tools/tvg_enc.py` writes TinyVG for the
 comparison).
@@ -105,12 +107,12 @@ void show_icon(const uint8_t *pic, uint32_t len)  /* pic may live in flash */
 A picture travels inside code as base64 with the prefix `mcuvg:`:
 
 ```lua
-mcuvg.draw("mcuvg:bVYSgAKAAgEAAAABAAletWqrD/NI8SB48KD4pvBrZoFAWnhmb/im9+p4+B/wA/CA9//LeMCcpbSlPMBUy3jwgPCAAA==")
+mcuvg.draw("mcuvg:bVYBAoACgAIBAAAAAQAJXrVqqw/zSPEgePCg+Kbwa2aBQFp4Zm/4pvfqePgf8APwgPf/y3jAnKW0pTzAVMt48IDwgAA=")
 ```
 
 ## The format
 
-`SPEC.md`: a 3-byte header (magic `mV`, grid, version), a colour table, then shapes. Each shape is one path filled
+`SPEC.md`: a 4-byte header (magic `mV`, the format version, flags with the grid), a colour table, then shapes. Each shape is one path filled
 and/or stroked: lines, horizontal/vertical lines, quadratic and cubic Béziers, SVG elliptical arcs; non-zero or even-odd
 fill; strokes with butt/round/square caps, miter/round/bevel joins and a miter limit; flat colours and linear/radial
 gradients of up to 8 stops. Coordinates are deltas on a grid the converter picks from the display size: 69 % of them
