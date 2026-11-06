@@ -69,18 +69,27 @@ def main():
                 junk[rnd.randrange(3, len(junk))] = rnd.randrange(256)
             lib.draw_mcuvg(bytes(junk), 64, 64, 0.25)
     print(f"cut pictures: {errs} of {total} prefixes refused (all must be); damaged pictures drawn without a crash")
-    # the version byte (SPEC.md 2.1): this decoder reads 1 .. its own; a newer one, 0, or a reserved flag bit is refused
+    # the version byte (SPEC.md 2.1): this decoder reads 1 .. its own (2); a newer one, 0, or a reserved flag bit is
+    # refused - and a build without version 2 (MCUVG_V2 0, a version 1 device) refuses version 2 cleanly
     b = mcuvg.encode(svgfront.load(files[0]), a.px)
     vbad = []
-    for what, i, v in (("version 0", 2, 0), ("version 2", 2, 2), ("version 255", 2, 255),
+    for what, i, v in (("version 0", 2, 0), ("version 3", 2, 3), ("version 255", 2, 255),
                        ("flag bit 4", 3, b[3] | 0x10), ("flag bit 5", 3, b[3] | 0x20), ("flag bit 7", 3, b[3] | 0x80)):
         x = bytearray(b)
         x[i] = v
         if lib.draw_mcuvg(bytes(x), 64, 64, 0.25)[1] == 0:
             vbad.append(what)
     ok = lib.draw_mcuvg(b, 64, 64, 0.25)[1] == 0
-    print(f"version byte: {'version 1 drawn' if ok else 'version 1 REFUSED'}, "
-          f"{'every newer version and reserved bit refused' if not vbad else 'ACCEPTED: ' + ', '.join(vbad)}")
+    x = bytearray(b)
+    x[2] = 2
+    ok = ok and lib.draw_mcuvg(bytes(x), 64, 64, 0.25)[1] == 0      # a version 1 body under a version 2 header
+    v1 = vg_host.Lib(extra=("-DMCUVG_V2=0",))
+    if v1.draw_mcuvg(bytes(x), 64, 64, 0.25)[1] == 0:
+        vbad.append("version 2 by a version 1 build")
+    if v1.draw_mcuvg(b, 64, 64, 0.25)[1] != 0:
+        vbad.append("version 1 REFUSED by a version 1 build")
+    print(f"version byte: {'versions 1 and 2 drawn' if ok else 'version 1 or 2 REFUSED'}, "
+          f"{'every newer version and reserved bit refused, a version 1 build refuses version 2' if not vbad else 'WRONG: ' + ', '.join(vbad)}")
     sys.exit(1 if diff or errs != total or vbad or not ok else 0)
 
 

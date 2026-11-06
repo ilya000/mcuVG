@@ -42,7 +42,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import svgfront  # noqa: E402
 
-VERSION = 1   # the format version written (the lowest that holds the picture) and the newest one read
+VERSION = 2   # the newest format version written (only when a picture needs it: SPEC.md 2.1) and read
+SPREAD = {"pad": 0, "reflect": 1, "repeat": 2}
+SPREAD_N = {v: k for k, v in SPREAD.items()}
 CAPS = {"butt": 0, "round": 1, "square": 2}
 JOINS = {"miter": 0, "miter-clip": 0, "arcs": 0, "round": 1, "bevel": 2}
 CAP_N = {v: k for k, v in CAPS.items() if k in ("butt", "round", "square")}
@@ -208,8 +210,11 @@ def simplify(segs, tol):
 
 
 class Enc:
-    def __init__(self, doc, px=240, prec=0.25, quality=None):
+    def __init__(self, doc, px=240, prec=0.25, quality=None, maxver=VERSION):
         self.doc = doc
+        self.maxver = maxver
+        self.v2 = False                                  # a version 2 record or paint written: the file says 2
+        self.last = None
         if quality is not None:
             prec = quality_prec(quality)
         self.F = grid_bits(doc, px, prec)
@@ -228,14 +233,33 @@ class Enc:
             self.colors.append(c)
         return varuint(self.colors.index(c))
 
-    def stops(self, st):
+    def stops(self, st, ext=b""):
         st = st[:8]
+        x = 0x40 if ext else 0
         if len(st) == 2 and st[0][0] == 0 and st[1][0] == 1:
-            return bytes([2 | 0x80]) + self.color(st[0][1]) + self.color(st[1][1])
-        out = bytes([len(st)])
+            return bytes([2 | 0x80 | x]) + ext + self.color(st[0][1]) + self.color(st[1][1])
+        out = bytes([len(st) | x]) + ext
         for o, c in st:
             out += bytes([max(0, min(255, int(round(o * 255))))]) + self.color(c)
         return out
+
+    def ext(self, p):
+        """a gradient's version 2 extension byte and fields (b"" when it is version 1's)"""
+        spread, focal, fr, ry, rot = svgfront.paint_ext(p)
+        if spread == "pad" and focal is None and ry is None:
+            return b""
+        if self.maxver < 2:
+            self.doc.dropped.append(("paint", "version 1: spread, focal point and ellipse dropped (pad, centre, circle)"))
+            return b""
+        self.v2 = True
+        x, out = SPREAD[spread], b""
+        if focal is not None:
+            x |= 4
+            out += zvar(self.q(focal[0])) + zvar(self.q(focal[1])) + varuint(max(0, self.q(fr)))
+        if ry is not None:
+            x |= 8
+            out += varuint(max(0, self.q(ry))) + zvar(int(round(rot)) % 360)
+        return bytes([x]) + out
 
     def paint(self, p):
         if p is None:
@@ -245,9 +269,13 @@ class Enc:
         if p[0] == "linear":
             x0, y0 = self.q(p[1][0]), self.q(p[1][1])
             x1, y1 = self.q(p[2][0]), self.q(p[2][1])
-            return 2, zvar(x0) + zvar(y0) + zvar(x1 - x0) + zvar(y1 - y0) + self.stops(p[3])
+            return 2, zvar(x0) + zvar(y0) + zvar(x1 - x0) + zvar(y1 - y0) + self.stops(p[3], self.ext(p))
         cx, cy = self.q(p[1][0]), self.q(p[1][1])
-        return 3, zvar(cx) + zvar(cy) + varuint(max(0, self.q(p[2]))) + self.stops(p[3])
+        r = p[2]
+        e = self.ext(p)
+        if not e and self.maxver < 2 and len(p) > 7 and p[7] is not None:
+            r = (p[2] + p[7]) / 2                     # version 1: an ellipse drawn as a circle of the mean radius
+        return 3, zvar(cx) + zvar(cy) + varuint(max(0, self.q(r))) + self.stops(p[3], e)
 
     def path(self, segs):
         cmds, ops = [], b""
@@ -316,33 +344,100 @@ class Enc:
         packed = acc.to_bytes((nbits + 7) // 8, "little") if nbits else b""
         return varuint(len(cmds)) + packed + ops
 
+    def shape(self, s):
+        fk, fp = self.paint(s["fill"])
+        sk, sp = self.paint(s["stroke"])
+        if not fk and not sk:
+            return b""
+        out = b""
+        if sk and s.get("dash"):
+            v, off = s["dash"]
+            if self.maxver < 2:
+                self.doc.dropped.append((s.get("tag", "shape"), "version 1: dashes drawn solid"))
+            else:
+                self.v2 = True
+                out += bytes([0x42, len(v)]) + b"".join(varuint(max(0, self.q(x))) for x in v) + zvar(self.q(off))
+        same = self.last is not None and s["segs"] == self.last
+        kind = fk | sk << 2 | (16 if s["rule"] == "evenodd" else 0) | (32 if same else 0)
+        out += bytes([kind]) + fp + sp
+        if sk:
+            ml = max(0, min(15, int(round((s["miter"] - 1) * 2))))
+            out += varuint(max(0, self.q(s["width"]))) + bytes([CAPS.get(s["cap"], 0) | JOINS.get(s["join"], 0) << 2 | ml << 4])
+        if not same:
+            out += self.path(simplify(s["segs"], self.tol))
+        self.last = s["segs"]
+        return out
+
+    def group(self, g):
+        """a version 2 group: its header (the clip path last in it), its body, its end"""
+        self.v2 = True
+        fl = 0
+        head = b""
+        b = svgfront.group_box(g) or (0.0, 0.0, 0.0, 0.0)
+        x0, y0 = int(math.floor(b[0] * self.k)), int(math.floor(b[1] * self.k))
+        x1, y1 = int(math.ceil(b[2] * self.k)), int(math.ceil(b[3] * self.k))
+        if g["opacity"] < 0.999:
+            fl |= 1
+            head += bytes([max(0, min(255, int(round(g["opacity"] * 255))))])
+        if g["shadows"]:
+            fl |= 8
+            head += bytes([len(g["shadows"])])
+            for dx, dy, sg, c in g["shadows"]:
+                head += zvar(self.q(dx)) + zvar(self.q(dy)) + varuint(max(0, self.q(sg))) + self.color(c)
+        if g["blur"] > 0:
+            fl |= 16
+            head += varuint(max(1, self.q(g["blur"])))
+        clip = b""
+        if g["clip"] is not None:
+            fl |= 2 | (4 if g["clip"]["rule"] == "evenodd" else 0)
+            clip = self.path(simplify(g["clip"]["segs"], self.tol))
+        self.last = None                                 # the context's path is not this file's last any more
+        body = self.items(g["items"]) + b"\x41"
+        self.last = None
+        return (bytes([0x40, fl]) + varuint(len(body)) + zvar(x0) + zvar(y0) + varuint(max(0, x1 - x0)) +
+                varuint(max(0, y1 - y0)) + head + clip + body)
+
+    def items(self, items):
+        out = b""
+        for it in items:
+            out += self.group(it) if "group" in it else self.shape(it)
+        return out
+
     def encode(self):
-        body = b""
-        last = None
-        for s in self.doc.shapes:
-            fk, fp = self.paint(s["fill"])
-            sk, sp = self.paint(s["stroke"])
-            if not fk and not sk:
-                continue
-            same = last is not None and s["segs"] == last
-            kind = fk | sk << 2 | (16 if s["rule"] == "evenodd" else 0) | (32 if same else 0)
-            body += bytes([kind]) + fp + sp
-            if sk:
-                ml = max(0, min(15, int(round((s["miter"] - 1) * 2))))
-                body += varuint(max(0, self.q(s["width"]))) + bytes([CAPS.get(s["cap"], 0) | JOINS.get(s["join"], 0) << 2 | ml << 4])
-            if not same:
-                body += self.path(simplify(s["segs"], self.tol))
-            last = s["segs"]
+        items = self.doc.shapes
+        if self.maxver < 2:
+            items = flatten_v1(self.doc, items)
+        body = self.items(items)
         alpha = any(c[3] != 255 for c in self.colors)
-        head = b"mV" + bytes([VERSION, self.F | (64 if alpha else 0)])
+        head = b"mV" + bytes([2 if self.v2 else 1, self.F | (64 if alpha else 0)])
         head += varuint(int(math.ceil(self.doc.vb[2]))) + varuint(int(math.ceil(self.doc.vb[3])))
         head += varuint(len(self.colors)) + b"".join(bytes(c if alpha else c[:3]) for c in self.colors)
         return head + body + b"\x00"
 
 
-def encode(doc, px=240, prec=0.25, quality=None):
-    """quality 1..100 (100: a grid step of 0.25 px at px, invisible) overrides prec when given"""
-    return Enc(doc, px, prec, quality).encode()
+def flatten_v1(doc, items, k=1.0):
+    """the tree as version 1 can draw it: groups opened, their opacity multiplied into each shape (approximately),
+    clips, shadows and blurs dropped - each reported"""
+    out = []
+    for it in items:
+        if "group" in it:
+            for what, on in (("clip", it["clip"] is not None), ("shadows", bool(it["shadows"])), ("blur", it["blur"] > 0)):
+                if on:
+                    doc.dropped.append(("g", f"version 1: {what} dropped"))
+            if it["opacity"] < 0.999:
+                doc.dropped.append(("g", "version 1: the group's opacity multiplied into each shape"))
+            out += flatten_v1(doc, it["items"], k * it["opacity"])
+        else:
+            if k < 0.999:
+                it = dict(it, fill=svgfront.scale_alpha(it["fill"], k), stroke=svgfront.scale_alpha(it["stroke"], k))
+            out.append(it)
+    return out
+
+
+def encode(doc, px=240, prec=0.25, quality=None, maxver=VERSION):
+    """quality 1..100 (100: a grid step of 0.25 px at px, invisible) overrides prec when given; maxver 1: a picture
+    every version 1 decoder draws (version 2's features approximated or dropped, and reported)"""
+    return Enc(doc, px, prec, quality, maxver).encode()
 
 
 # ---- decoder (the reference the C decoder is checked against) --------------------------------------------------------
@@ -391,19 +486,35 @@ def decode(b):
     for _ in range(r.vu()):
         c = tuple(r.u8() for _ in range(4 if alpha else 3))
         cols.append(c if alpha else c + (255,))
-    pen = [0, 0]
-    last = None
-    lastr = [(0, 0, 0)]
+    ver = b[2]
+    st = {"pen": [0, 0], "last": None, "lastr": (0, 0, 0)}
 
-    def stops():
+    def stops(kind):
         n = r.u8()
+        ext = ("pad", None, 0.0, None, 0.0)
+        if n & 0x40:
+            assert ver >= 2, "a version 2 gradient in a version 1 file"
+            x = r.u8()
+            assert not x & 0xF0 and x & 3 != 3, "a gradient's extension"
+            spread, focal, fr, ry, rot = SPREAD_N[x & 3], None, 0.0, None, 0.0
+            if x & 4:
+                assert kind == 3, "a focal point on a linear gradient"
+                focal = (r.zv() / k, r.zv() / k)
+                fr = r.vu() / k
+            if x & 8:
+                assert kind == 3, "an ellipse on a linear gradient"
+                ry = r.vu() / k
+                rot = float(r.zv())
+            ext = (spread, focal, fr, ry, rot)
+            n &= ~0x40
         if n & 0x80:
-            return [(0.0, cols[r.vu()]), (1.0, cols[r.vu()])]
+            assert n & 0x7F == 2, "two stops"
+            return [(0.0, cols[r.vu()]), (1.0, cols[r.vu()])], ext
         out = []
         for _ in range(n):
             o = r.u8() / 255.0
             out.append((o, cols[r.vu()]))
-        return out
+        return out, ext
 
     def paint(kind):
         if kind == 0:
@@ -413,83 +524,131 @@ def decode(b):
         if kind == 2:
             x0, y0 = r.zv(), r.zv()
             dx, dy = r.zv(), r.zv()
-            return ("linear", (x0 / k, y0 / k), ((x0 + dx) / k, (y0 + dy) / k), stops())
+            sts, ext = stops(2)
+            return ("linear", (x0 / k, y0 / k), ((x0 + dx) / k, (y0 + dy) / k), sts, ext[0])
         cx, cy = r.zv(), r.zv()
         rr = r.vu()
-        return ("radial", (cx / k, cy / k), rr / k, stops(), (cx / k, cy / k))
+        sts, (spread, focal, fr, ry, rot) = stops(3)
+        C = (cx / k, cy / k)
+        return ("radial", C, rr / k, sts, focal if focal is not None else C, spread, fr,
+                ry if ry is not None else rr / k, rot)
 
-    while True:
-        kind = r.u8()
-        if kind == 0:
-            break
-        fill = paint(kind & 3)
-        stroke = paint(kind >> 2 & 3)
-        width, cap, join, miter = 0.0, "butt", "miter", 4.0
-        if stroke:
-            width = r.vu() / k
-            st = r.u8()
-            cap, join, miter = CAP_N.get(st & 3, "butt"), JOIN_N.get(st >> 2 & 3, "miter"), 1 + (st >> 4) / 2
-        if kind & 32:
-            segs = last
-        else:
-            n = r.vu()
-            cmds, bit = [], 0
-            start = r.i
+    def path():
+        n = r.vu()
+        cmds, bit = [], 0
+        start = r.i
 
-            def bits(k):
-                nonlocal bit
-                v = 0
-                for j in range(k):
-                    v |= ((b[start + (bit + j) // 8] >> ((bit + j) % 8)) & 1) << j
-                bit += k
-                return v
-            for i in range(n):
-                c = bits(3)
-                cmds.append(c | bits(3) << 3 if c == 5 else c)
-            r.i = start + (bit + 7) // 8
-            segs = []
-            px, py = pen
-            sx, sy = px, py
-            for c in cmds:
-                if c in (0, 6):
+        def bits(nb):
+            nonlocal bit
+            v = 0
+            for j in range(nb):
+                v |= ((b[start + (bit + j) // 8] >> ((bit + j) % 8)) & 1) << j
+            bit += nb
+            return v
+        for i in range(n):
+            c = bits(3)
+            cmds.append(c | bits(3) << 3 if c == 5 else c)
+        r.i = start + (bit + 7) // 8
+        segs = []
+        px, py = st["pen"]
+        sx, sy = px, py
+        for c in cmds:
+            if c in (0, 6):
+                px += r.zv()
+                py += r.zv()
+                segs.append(("L" if c == 0 else "M", px / k, py / k))
+                if c == 6:
+                    sx, sy = px, py
+            elif c == 1:
+                px += r.zv()
+                segs.append(("L", px / k, py / k))
+            elif c == 2:
+                py += r.zv()
+                segs.append(("L", px / k, py / k))
+            elif c in (3, 4):
+                pts = []
+                for _ in range(3 if c == 3 else 2):
                     px += r.zv()
                     py += r.zv()
-                    segs.append(("L" if c == 0 else "M", px / k, py / k))
-                    if c == 6:
-                        sx, sy = px, py
-                elif c == 1:
-                    px += r.zv()
-                    segs.append(("L", px / k, py / k))
-                elif c == 2:
-                    py += r.zv()
-                    segs.append(("L", px / k, py / k))
-                elif c in (3, 4):
-                    pts = []
-                    for _ in range(3 if c == 3 else 2):
-                        px += r.zv()
-                        py += r.zv()
-                        pts += [px / k, py / k]
-                    segs.append(("C" if c == 3 else "Q",) + tuple(pts))
-                elif c & 7 == 5:
-                    f = c >> 3
-                    if not f & 4:
-                        v = r.vu()
-                        rx, ry, rot = v >> 1, v >> 1, 0
-                        if v & 1:
-                            ry = r.vu()
-                            rot = r.zv()
-                        lastr[0] = (rx, ry, rot)
-                    rx, ry, rot = lastr[0]
-                    px += r.zv()
-                    py += r.zv()
-                    segs.append(("A", rx / k, ry / k, float(rot), f & 1, (f >> 1) & 1, px / k, py / k))
-                elif c == 7:
-                    segs.append(("Z",))
-                    px, py = sx, sy
-            pen = [px, py]
-        last = segs
-        d.shapes.append({"segs": segs, "fill": fill, "stroke": stroke, "width": width, "cap": cap, "join": join,
-                         "miter": miter, "rule": "evenodd" if kind & 16 else "nonzero", "tag": "mcuvg"})
+                    pts += [px / k, py / k]
+                segs.append(("C" if c == 3 else "Q",) + tuple(pts))
+            elif c & 7 == 5:
+                f = c >> 3
+                if not f & 4:
+                    v = r.vu()
+                    rx, ry, rot = v >> 1, v >> 1, 0
+                    if v & 1:
+                        ry = r.vu()
+                        rot = r.zv()
+                    st["lastr"] = (rx, ry, rot)
+                rx, ry, rot = st["lastr"]
+                px += r.zv()
+                py += r.zv()
+                segs.append(("A", rx / k, ry / k, float(rot), f & 1, (f >> 1) & 1, px / k, py / k))
+            elif c == 7:
+                segs.append(("Z",))
+                px, py = sx, sy
+        st["pen"] = [px, py]
+        return segs
+
+    def body(out, in_group):
+        dash = None
+        while True:
+            kind = r.u8()
+            if kind == 0:
+                assert not in_group, "a group not ended"
+                return
+            assert not kind & 0x80, "a reserved kind"
+            if kind & 0x40:
+                assert ver >= 2, "a version 2 record in a version 1 file"
+                if kind == 0x41:
+                    assert in_group, "a group's end outside a group"
+                    return
+                if kind == 0x42:
+                    n = r.u8()
+                    assert 1 <= n <= 8, "dashes"
+                    dash = ([r.vu() / k for _ in range(n)], r.zv() / k)
+                    continue
+                assert kind == 0x40, "an unknown record"
+                fl = r.u8()
+                assert not fl & 0xE0, "a group's flags"
+                blen = r.vu()
+                gx, gy, gw, gh = r.zv(), r.zv(), r.vu(), r.vu()
+                g = {"group": True, "opacity": 1.0, "clip": None, "shadows": [], "blur": 0.0, "items": [], "tag": "g",
+                     "bbox": (gx / k, gy / k, (gx + gw) / k, (gy + gh) / k)}
+                if fl & 1:
+                    g["opacity"] = r.u8() / 255.0
+                if fl & 8:
+                    for _ in range(r.u8()):
+                        g["shadows"].append((r.zv() / k, r.zv() / k, r.vu() / k, cols[r.vu()]))
+                if fl & 16:
+                    g["blur"] = r.vu() / k
+                if fl & 2:
+                    g["clip"] = {"segs": path(), "rule": "evenodd" if fl & 4 else "nonzero"}
+                start = r.i
+                st["last"] = None
+                body(g["items"], True)
+                assert r.i == start + blen, "a group's length"
+                st["last"] = None
+                out.append(g)
+                continue
+            fill = paint(kind & 3)
+            stroke = paint(kind >> 2 & 3)
+            width, cap, join, miter = 0.0, "butt", "miter", 4.0
+            if stroke:
+                width = r.vu() / k
+                sb = r.u8()
+                cap, join, miter = CAP_N.get(sb & 3, "butt"), JOIN_N.get(sb >> 2 & 3, "miter"), 1 + (sb >> 4) / 2
+            segs = st["last"] if kind & 32 else path()
+            st["last"] = segs
+            sh = {"segs": segs, "fill": fill, "stroke": stroke, "width": width, "cap": cap, "join": join,
+                  "miter": miter, "rule": "evenodd" if kind & 16 else "nonzero", "tag": "mcuvg"}
+            if dash and stroke:
+                sh["dash"] = dash
+            dash = None
+            out.append(sh)
+
+    body(d.shapes, False)
     return d
 
 

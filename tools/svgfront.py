@@ -81,7 +81,7 @@ NAMED = {                  # the CSS colour keywords (148), and transparent
 }
 
 INHERITED = ("fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "fill-rule",
-             "fill-opacity", "stroke-opacity", "color", "stroke-dasharray", "visibility", "display",
+             "fill-opacity", "stroke-opacity", "color", "stroke-dasharray", "stroke-dashoffset", "visibility", "display",
              "font-family", "font-size", "font-weight", "font-style", "text-anchor", "letter-spacing",
              "marker-start", "marker-mid", "marker-end")
 NOT_INHERITED = ("opacity", "transform", "stop-color", "stop-opacity", "clip-path", "mask", "filter")
@@ -481,7 +481,8 @@ class Doc:
     def __init__(self):
         self.w = self.h = 0.0
         self.vb = (0.0, 0.0, 0.0, 0.0)
-        self.shapes = []           # dicts: segs, fill, stroke, width, cap, join, miter, rule
+        self.shapes = []           # dicts: segs, fill, stroke, width, cap, join, miter, rule [, dash]; and groups
+        self.stack = [self.shapes]  # where the next shape goes (a group's items while it is open)
         self.dropped = []          # (what, why)
         self.converted = []        # (what, how): text and markers turned into ordinary paths here
         self.root = None
@@ -560,8 +561,9 @@ def gradient(doc, defs, gid, bbox, m, rules, seen=()):
         stops.append((off, c[:3] + (round(c[3] * a),)))
     if not stops:
         return None
-    if (attr("spreadMethod") or "pad") != "pad":
-        doc.dropped.append(("paint", f"#{gid}: spreadMethod {attr('spreadMethod')} drawn as pad"))
+    spread = (attr("spreadMethod") or "pad").strip()
+    if spread not in ("pad", "reflect", "repeat"):
+        spread = "pad"
     units = attr("gradientUnits") or "objectBoundingBox"
     gm = parse_transform(attr("gradientTransform"))
     if units == "objectBoundingBox":
@@ -577,19 +579,52 @@ def gradient(doc, defs, gid, bbox, m, rules, seen=()):
     if tag == "linearGradient" or chain[0].tag == NS + "linearGradient":
         p1 = (length(attr("x1"), ref_w, 0.0), length(attr("y1"), ref_h, 0.0))
         p2 = (length(attr("x2"), ref_w, ref_w), length(attr("y2"), ref_h, 0.0))
-        return ("linear", mat_apply(full, *p1), mat_apply(full, *p2), stops)
+        # t is linear in the picture's coordinates under any affine map: t = n . u + c0, n = L^-T d / |d|^2 (a skew or a
+        # non-uniform scale turns the isolines; mapping the two end points alone would not)
+        a, b, cc, d_, e, f_ = full
+        det = a * d_ - b * cc
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        dd = dx * dx + dy * dy
+        if abs(det) < 1e-12 or dd == 0:
+            return ("linear", mat_apply(full, *p1), mat_apply(full, *p2), stops, spread)
+        nx, ny = (d_ * dx - b * dy) / det / dd, (-cc * dx + a * dy) / det / dd
+        c0 = -(nx * e + ny * f_) - (p1[0] * dx + p1[1] * dy) / dd
+        nn = nx * nx + ny * ny
+        P0 = (-c0 * nx / nn, -c0 * ny / nn)
+        return ("linear", P0, (P0[0] + nx / nn, P0[1] + ny / nn), stops, spread)
     ref = math.hypot(ref_w, ref_h) / math.sqrt(2)
     c = (length(attr("cx"), ref_w, 0.5 * ref_w), length(attr("cy"), ref_h, 0.5 * ref_h))
     r = length(attr("r"), ref, 0.5 * ref)
     f = (length(attr("fx"), ref_w, c[0]), length(attr("fy"), ref_h, c[1]))
+    fr = length(attr("fr"), ref, 0.0)
     C = mat_apply(full, *c)
-    R = (mat_apply(full, c[0] + r, c[1]), mat_apply(full, c[0], c[1] + r))
-    rx, ry = math.dist(C, R[0]), math.dist(C, R[1])
-    if abs(rx - ry) > 0.02 * max(rx, ry):
-        doc.dropped.append(("paint", f"#{gid}: elliptic radial gradient drawn as circular"))
-    if math.dist(c, f) > 0.01 * max(r, 1e-9):
-        doc.dropped.append(("paint", f"#{gid}: the focal point (fx, fy) ignored - drawn from the centre"))
-    return ("radial", C, (rx + ry) / 2, stops, mat_apply(full, *f))
+    # the circle through the map is an ellipse: its axes from M M^T, M = r L (the isolines are its scaled copies)
+    a, b, cc, d_ = full[0] * r, full[1] * r, full[2] * r, full[3] * r
+    A, B, D = a * a + cc * cc, a * b + cc * d_, b * b + d_ * d_
+    mid, rad = (A + D) / 2, math.sqrt(((A - D) / 2) ** 2 + B * B)
+    rx, ry = math.sqrt(max(mid + rad, 0.0)), math.sqrt(max(mid - rad, 0.0))
+    rot = math.degrees(0.5 * math.atan2(2 * B, A - D))
+    if abs(rx - ry) <= 1e-6 * max(rx, 1e-9):
+        ry, rot = rx, 0.0
+    F = mat_apply(full, *f)
+    frx = fr / r * rx if r > 0 else 0.0               # the focal radius in the same measure as rx
+    return ("radial", C, rx, stops, F, spread, frx, ry, rot)
+
+
+def paint_ext(p):
+    """a gradient's version 2 parts: (spread, focal point or None, focal radius, ry, rot); version 1's when none"""
+    if p is None or p[0] == "flat":
+        return ("pad", None, 0.0, None, 0.0)
+    if p[0] == "linear":
+        return (p[4] if len(p) > 4 else "pad", None, 0.0, None, 0.0)
+    C, rx = p[1], p[2]
+    F = p[4] if len(p) > 4 else C
+    spread = p[5] if len(p) > 5 else "pad"
+    fr = p[6] if len(p) > 6 else 0.0
+    ry = p[7] if len(p) > 7 else rx
+    rot = p[8] if len(p) > 8 else 0.0
+    focal = F if (math.dist(F, C) > 1e-6 * max(rx, 1e-9) or fr > 0) else None
+    return (spread, focal, fr, ry if abs(ry - rx) > 1e-6 * max(rx, 1e-9) or abs(rot) > 1e-9 else None, rot)
 
 
 def scale_alpha(paint, k):
@@ -665,6 +700,7 @@ def viewport(el):
 
 
 def walk(doc, el, tag, inh, m, opa, defs, rules, in_use):
+    """one element: its style and matrix; a group of version 2 around it when it has an opacity, a clip or a filter"""
     st = own_style(el, tag, rules)
     cur = dict(inh)
     for k in INHERITED:
@@ -673,10 +709,29 @@ def walk(doc, el, tag, inh, m, opa, defs, rules, in_use):
     if cur.get("display") == "none" or st.get("display") == "none":
         return
     m = mat_mul(m, parse_transform(st.get("transform")))
-    opa = opa * float(st.get("opacity", "1"))
-    for k in ("clip-path", "mask", "filter"):
-        if st.get(k) and st[k] != "none":
-            doc.dropped.append((tag, f"{k}={st[k]} ignored"))
+    gop = float(st.get("opacity", "1"))
+    if st.get("mask") and st["mask"] != "none":
+        doc.dropped.append((tag, f"mask={st['mask']} ignored"))
+    clip = clip_of(doc, _url(st.get("clip-path")), m, defs, rules, tag) if st.get("clip-path") not in (None, "none") else None
+    filt = filter_of(doc, _url(st.get("filter")), m, defs, rules, tag) if st.get("filter") not in (None, "none") else None
+    opened = 0
+    if gop < 0.999 or clip:                     # SVG's order: the filter, then the clip, then the opacity - outermost
+        open_group(doc, gop if gop < 0.999 else 1.0, clip, [], 0.0)
+        opened += 1
+    if filt:
+        open_group(doc, 1.0, None, filt[0], filt[1])
+        opened += 1
+    if opened:
+        try:
+            walk_inner(doc, el, tag, st, cur, m, opa, defs, rules, in_use)
+        finally:
+            for _ in range(opened):
+                close_group(doc)
+        return
+    walk_inner(doc, el, tag, st, cur, m, opa, defs, rules, in_use)
+
+
+def walk_inner(doc, el, tag, st, cur, m, opa, defs, rules, in_use):
     if tag in ("svg", "g", "a"):
         if tag == "svg" and el is not doc.root:   # a nested viewport: x, y, width, height and its viewBox
             m = mat_mul(m, viewport(el))
@@ -753,11 +808,24 @@ def emit(doc, tag, segs, cur, m, opa, defs, rules):
             k = math.sqrt(abs(m[0] * m[3] - m[1] * m[2]))
             width *= k
             doc.dropped.append((tag, "stroke under a non-uniform transform drawn with the mean width"))
-        if cur.get("stroke-dasharray") not in (None, "none"):
-            doc.dropped.append((tag, "dashes drawn as a solid line"))
+    dash = None
+    if stroke is not None and cur.get("stroke-dasharray") not in (None, "none", ""):
+        diag = math.hypot(doc.vb[2], doc.vb[3]) / math.sqrt(2)
+        try:
+            v = [length(x, diag, 0.0) for x in re.split(r"[\s,]+", cur["stroke-dasharray"].strip()) if x]
+        except ValueError:
+            v = []
+        if v and min(v) >= 0 and sum(v) > 0:
+            if len(v) % 2:
+                v = v * 2
+            k = sim[0] if sim else math.sqrt(abs(m[0] * m[3] - m[1] * m[2]))
+            if len(v) <= 8:
+                dash = ([x * k for x in v], length(cur.get("stroke-dashoffset"), diag, 0.0) * k)
+            else:
+                doc.dropped.append((tag, f"stroke-dasharray of {len(v)} lengths (8 at most): drawn solid"))
     if fill is None and (stroke is None or width <= 0):
         return
-    doc.shapes.append({
+    shape = {
         "segs": transform_segs(segs, m),
         "fill": fill,
         "stroke": stroke if width > 0 else None,
@@ -767,8 +835,256 @@ def emit(doc, tag, segs, cur, m, opa, defs, rules):
         "miter": float(cur.get("stroke-miterlimit", "4")),
         "rule": cur.get("fill-rule", "nonzero"),
         "tag": tag,
-    })
+    }
+    if dash:
+        shape["dash"] = dash
+    doc.stack[-1].append(shape)
 
+
+
+# ---- groups (version 2): exact opacity, clipping, shadows and glows, blur ------------------------------------------------
+
+def open_group(doc, opacity, clip, shadows, blur):
+    g = {"group": True, "opacity": opacity, "clip": clip, "shadows": list(shadows), "blur": blur, "items": [],
+         "tag": "g"}
+    doc.stack[-1].append(g)
+    doc.stack.append(g["items"])
+
+
+def close_group(doc):
+    items = doc.stack.pop()
+    parent = doc.stack[-1]
+    g = parent[-1]
+    if not items:                                       # draws nothing
+        parent.pop()
+        return
+    # opacity alone over one shape that only fills or only strokes: exactly its paint's alpha - no layer
+    if (g["clip"] is None and not g["shadows"] and not g["blur"] and len(items) == 1 and "group" not in items[0]
+            and (items[0]["fill"] is None or items[0]["stroke"] is None)):
+        sh = items[0]
+        sh["fill"] = scale_alpha(sh["fill"], g["opacity"])
+        sh["stroke"] = scale_alpha(sh["stroke"], g["opacity"])
+        parent[-1] = sh
+        return
+    if g["opacity"] >= 0.999 and g["clip"] is None and not g["shadows"] and not g["blur"]:
+        parent[-1:] = items                               # an empty group: its items in its place
+        return
+
+
+def item_box(it):
+    """what an item draws, at most: (x0, y0, x1, y1) in the picture's units"""
+    if "group" in it:
+        b = group_box(it)
+        if b is None:
+            return None
+        g = 0.0
+        for dx, dy, sg, _c in it["shadows"]:
+            g = max(g, abs(dx) + 3 * sg, abs(dy) + 3 * sg)
+        g = max(g, 3 * it["blur"])
+        return (b[0] - g, b[1] - g, b[2] + g, b[3] + g)
+    b = segs_bbox(it["segs"])
+    if it["stroke"] is not None:
+        hw = it["width"] / 2 * (max(1.0, it["miter"]) if it["join"] == "miter" else 1.0) * (1.42 if it["cap"] == "square" else 1.0)
+        b = (b[0] - hw, b[1] - hw, b[2] + hw, b[3] + hw)
+    return b
+
+
+def group_box(g):
+    """the box of the group's own drawing (its items, inside its clip) - what its record carries"""
+    bs = [b for b in (item_box(it) for it in g["items"]) if b is not None]
+    if not bs:
+        return None
+    b = (min(x[0] for x in bs), min(x[1] for x in bs), max(x[2] for x in bs), max(x[3] for x in bs))
+    if g["clip"] is not None:
+        c = segs_bbox(g["clip"]["segs"])
+        b = (max(b[0], c[0]), max(b[1], c[1]), min(b[2], c[2]), min(b[3], c[3]))
+        if b[0] >= b[2] or b[1] >= b[3]:
+            return (b[0], b[1], b[0], b[1])
+    return b
+
+
+def flat_items(items):
+    """every shape of a tree, groups opened (what a version 1 picture of it draws)"""
+    for it in items:
+        if "group" in it:
+            yield from flat_items(it["items"])
+        else:
+            yield it
+
+
+def clip_of(doc, cid, m, defs, rules, tag):
+    """clip-path=url(#cid) -> {"segs", "rule"} in the picture's coordinates, or None (reported)"""
+    el = defs.get(cid) if cid else None
+    if el is None or el.tag.replace(NS, "") != "clipPath":
+        doc.dropped.append((tag, f"clip-path #{cid} not found"))
+        return None
+    if (el.get("clipPathUnits") or "userSpaceOnUse") != "userSpaceOnUse":
+        doc.dropped.append((tag, f"clip-path #{cid}: clipPathUnits objectBoundingBox not supported - not clipped"))
+        return None
+    cm = mat_mul(m, parse_transform(el.get("transform")))
+    segs, rule = [], None
+    for ch in el:
+        t = ch.tag.replace(NS, "") if isinstance(ch.tag, str) else ""
+        if not t:
+            continue
+        if t == "use":
+            href = ch.get(XLINK) or ch.get("href") or ""
+            ref = defs.get(href[1:]) if href.startswith("#") else None
+            if ref is None:
+                continue
+            um = mat_mul(cm, mat_mul(parse_transform(ch.get("transform")),
+                                     (1, 0, 0, 1, length(ch.get("x")), length(ch.get("y")))))
+            ch, t = ref, ref.tag.replace(NS, "")
+        else:
+            um = cm
+        cst = own_style(ch, t, rules)
+        sg = shape_segs(ch, t, cst)
+        if not sg:
+            if t not in ("title", "desc"):
+                doc.dropped.append((tag, f"clip-path #{cid}: <{t}> in it not supported"))
+            continue
+        segs += transform_segs(sg, mat_mul(um, parse_transform(cst.get("transform"))))
+        if rule is None:
+            rule = cst.get("clip-rule") or el.get("clip-rule") or "nonzero"
+    if not segs:
+        return {"segs": [("M", 0.0, 0.0), ("Z",)], "rule": "nonzero"}      # clips everything away
+    return {"segs": segs, "rule": rule or "nonzero"}
+
+
+def _num(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def filter_of(doc, fid, m, defs, rules, tag):
+    """filter=url(#fid) -> (shadows [(dx, dy, sigma, rgba)], blur sigma) in the picture's units, or None (reported).
+    The filter graph is evaluated symbolically: what it may build is the element's own drawing (SourceGraphic, perhaps
+    blurred) over shadows - coloured, offset, blurred copies of its alpha (SourceAlpha): feDropShadow, feGaussianBlur,
+    feOffset, feFlood with feComposite "in", feColorMatrix that colours an alpha, feMerge, feBlend "normal" - and the
+    common exports (Figma's drop shadow).  Anything else (inner shadows, lighting, turbulence...) is reported."""
+    el = defs.get(fid) if fid else None
+    if el is None or el.tag.replace(NS, "") != "filter":
+        doc.dropped.append((tag, f"filter #{fid} not found"))
+        return None
+    if (el.get("primitiveUnits") or "userSpaceOnUse") != "userSpaceOnUse":
+        doc.dropped.append((tag, f"filter #{fid}: primitiveUnits objectBoundingBox not supported - drawn without it"))
+        return None
+    k = math.sqrt(abs(m[0] * m[3] - m[1] * m[2]))
+
+    def vec(dx, dy):
+        return (m[0] * dx + m[2] * dy, m[1] * dx + m[3] * dy)
+
+    SRC, ALPHA = ("src", 0.0), ("alpha", 0.0, 0.0, 0.0, (0, 0, 0, 255))
+    res, last = {}, SRC
+
+    def get(name):
+        if name in (None, ""):
+            return last
+        if name == "SourceGraphic":
+            return SRC
+        if name == "SourceAlpha":
+            return ALPHA
+        if name in ("BackgroundImage", "BackgroundAlpha"):
+            return ("empty",)
+        return res.get(name, ("bad", f"result {name} unknown"))
+
+    def merge(lower, upper):
+        out = []
+        for t in (lower, upper):
+            if t[0] == "merge":
+                out += t[1]
+            elif t[0] != "empty":
+                out.append(t)
+        return ("merge", out) if len(out) != 1 else out[0]
+
+    for pr in el:
+        t = pr.tag.replace(NS, "") if isinstance(pr.tag, str) else ""
+        if not t:
+            continue
+        pst = own_style(pr, t, rules)
+        a = get(pr.get("in"))
+        if t == "feGaussianBlur":
+            sd = [_num(x) for x in re.split(r"[\s,]+", (pr.get("stdDeviation") or "0").strip()) if x]
+            sdv = sum(sd) / len(sd) if sd else 0.0
+            if len(sd) == 2 and abs(sd[0] - sd[1]) > 1e-6:
+                doc.dropped.append((tag, f"filter #{fid}: an uneven blur {sd} drawn with sigma {sdv:g}"))
+            sg = sdv * k
+            if a[0] == "src":
+                out = ("src", math.hypot(a[1], sg))
+            elif a[0] == "alpha":
+                out = ("alpha", a[1], a[2], math.hypot(a[3], sg), a[4])
+            else:
+                out = ("bad", "a blur of a mixture")
+        elif t == "feOffset":
+            dx, dy = vec(_num(pr.get("dx")), _num(pr.get("dy")))
+            out = ("alpha", a[1] + dx, a[2] + dy, a[3], a[4]) if a[0] == "alpha" else ("bad", "an offset of the drawing")
+        elif t == "feFlood":
+            c = parse_color(pst.get("flood-color", "black")) or (0, 0, 0, 0)
+            al = round(c[3] * _num(pst.get("flood-opacity", "1"), 1.0))
+            out = ("flood", c[:3] + (al,)) if al > 0 else ("empty",)
+        elif t == "feComposite":
+            b2 = get(pr.get("in2"))
+            op = pr.get("operator") or "over"
+            if op == "in" and a[0] == "flood" and b2[0] == "alpha":
+                c = a[1]
+                out = ("alpha", b2[1], b2[2], b2[3], c[:3] + (round(c[3] * b2[4][3] / 255),))
+            elif op == "in" and a[0] == "empty":
+                out = ("empty",)
+            elif op == "over":
+                out = merge(b2, a)
+            else:
+                out = ("bad", f"feComposite {op}")
+        elif t == "feColorMatrix":
+            ty = pr.get("type") or "matrix"
+            v = [_num(x) for x in re.split(r"[\s,]+", (pr.get("values") or "").strip()) if x]
+            if ty == "matrix" and len(v) == 20 and a[0] == "alpha" and all(abs(v[i]) < 1e-9 for i in
+                                                                             (0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17)):
+                al = max(0.0, min(1.0, v[18] * a[4][3] / 255 + v[19]))   # alpha row: A * alpha (+ an offset)
+                if v[18] > 1.5:                       # Figma's "hardAlpha": the alpha made opaque - an alpha still
+                    out = a
+                else:
+                    out = ("alpha", a[1], a[2], a[3], tuple(max(0, min(255, round(x * 255))) for x in (v[4], v[9], v[14]))
+                           + (round(al * 255),))
+            elif a[0] == "empty":
+                out = a
+            else:
+                out = ("bad", f"feColorMatrix {ty}")
+        elif t == "feDropShadow":
+            dx, dy = vec(_num(pr.get("dx"), 2.0), _num(pr.get("dy"), 2.0))
+            c = parse_color(pst.get("flood-color", "black")) or (0, 0, 0, 0)
+            sh = ("alpha", dx, dy, _num(pr.get("stdDeviation"), 2.0) * k, c[:3] + (round(c[3] * _num(pst.get("flood-opacity", "1"), 1.0)),))
+            out = merge(sh, a) if a[0] in ("src", "merge") else ("bad", "a drop shadow of a mixture")
+        elif t == "feMerge":
+            out = ("empty",)
+            for nd in pr:
+                if isinstance(nd.tag, str) and nd.tag.replace(NS, "") == "feMergeNode":
+                    out = merge(out, get(nd.get("in")))
+        elif t == "feBlend":
+            mode = pr.get("mode") or "normal"
+            out = merge(get(pr.get("in2")), a) if mode == "normal" else ("bad", f"feBlend {mode}")
+        else:
+            out = ("bad", t)
+        if out[0] == "bad":
+            doc.dropped.append((tag, f"filter #{fid}: {out[1]} not supported - drawn without the filter"))
+            return None
+        last = out
+        if pr.get("result"):
+            res[pr.get("result")] = out
+    terms = last[1] if last[0] == "merge" else [last]
+    srcs = [i for i, t in enumerate(terms) if t[0] == "src"]
+    if len(srcs) != 1 or srcs[0] != len(terms) - 1 or any(t[0] not in ("alpha", "src") for t in terms):
+        doc.dropped.append((tag, f"filter #{fid}: its result is not the drawing over its shadows - drawn without it"))
+        return None
+    shadows = [(t[1], t[2], t[3], t[4]) for t in terms[:-1] if t[4][3] > 0]
+    if len(shadows) > 4:
+        doc.dropped.append((tag, f"filter #{fid}: {len(shadows)} shadows, the first 4 drawn"))
+        shadows = shadows[:4]
+    blur = terms[-1][1]
+    if not shadows and blur <= 0:
+        return None
+    return (shadows, blur)
 
 # ---- markers: copies of the marker's content at the path's vertices ----------------------------------------------------
 

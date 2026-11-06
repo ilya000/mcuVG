@@ -108,6 +108,11 @@ int mcuvg_init(mcuvg_ctx *c, void *px, int w, int h, int stride, int fmt, void *
     for (int i = 0; i < (w + 2 + 31) / 32 + 1; i++) c->tb[i] = 0;
     mcuvg_identity(c);
     mcuvg_begin(c);
+#if MCUVG_V2
+    c->ndash = 0; c->dash_off = 0;
+    c->mask = 0; c->mx0 = c->my0 = c->mw = c->mh = 0; c->ox = c->oy = 0;
+    c->lm = 0; c->llen = c->lused = 0; c->depth = 0;
+#endif
     return MCUVG_OK;
 }
 
@@ -445,8 +450,12 @@ struct pnt {
     int kind;
     uint32_t flat;                     /* premultiplied */
     float ga, gb, gc;                  /* linear: t = ga x + gb y + gc at a pixel's centre */
-    float ia, ib, ic, id, ie, iff;     /* radial: the inverse matrix, device -> user */
-    float cx, cy, rinv;
+    float ua, ub, uc, ud, ue, uf;      /* radial: device -> the gradient's unit circle: u = ua x + uc y + ue,
+                                          v = ub x + ud y + uf; t = |(u, v)| */
+#if MCUVG_V2
+    int spread, focal;
+    float fx, fy, fr, fa, dr;          /* the focal circle in the unit circle's space; fa = |f|^2 - dr^2, dr = 1 - fr */
+#endif
 };
 
 static int paint_setup(mcuvg_ctx *c, const mcuvg_paint *p, struct pnt *q)
@@ -459,6 +468,10 @@ static int paint_setup(mcuvg_ctx *c, const mcuvg_paint *p, struct pnt *q)
     float ia = m->d / det, ib = -m->b / det, ic = -m->c / det, id = m->a / det;
     float ie = -(ia * m->e + ic * m->f), iff = -(ib * m->e + id * m->f);
     lut_fill(lut_of(c), p);
+#if MCUVG_V2
+    q->spread = p->spread;
+    q->focal = 0;
+#endif
     if (p->kind == MCUVG_LINEAR) {
         float dx = p->x1 - p->x0, dy = p->y1 - p->y0, l2 = dx * dx + dy * dy;
         if (l2 == 0) { q->kind = MCUVG_FLAT; q->flat = lut_of(c)[255]; return 0; }
@@ -468,9 +481,29 @@ static int paint_setup(mcuvg_ctx *c, const mcuvg_paint *p, struct pnt *q)
         q->gc = gx * (ie - p->x0) + gy * (iff - p->y0);
         return 0;
     }
-    q->ia = ia; q->ib = ib; q->ic = ic; q->id = id; q->ie = ie; q->iff = iff;
-    q->cx = p->x0; q->cy = p->y0;
-    q->rinv = p->x1 > 0 ? 1.0f / p->x1 : 0.0f;
+    /* radial: device -> user (the inverse of m) -> the unit circle: (user - centre) turned back by rot, then divided by
+       the radii (version 1: rot 0, both radii x1) - one affine map a pixel, as cheap as the circle alone */
+    float rx = p->x1, ry = rx, cr = 1.0f, sr = 0.0f;
+#if MCUVG_V2
+    if (p->ry > 0) ry = p->ry;
+    if (p->rot != 0.0f) sincos_(p->rot * (PI_F / 180.0f), &sr, &cr);
+#endif
+    if (!(rx > 0) || !(ry > 0)) { q->kind = MCUVG_FLAT; q->flat = lut_of(c)[255]; return 0; }
+    float kx = 1.0f / rx, ky = 1.0f / ry, ex = ie - p->x0, ey = iff - p->y0;
+    q->ua = (cr * ia + sr * ib) * kx; q->uc = (cr * ic + sr * id) * kx; q->ue = (cr * ex + sr * ey) * kx;
+    q->ub = (cr * ib - sr * ia) * ky; q->ud = (cr * id - sr * ic) * ky; q->uf = (cr * ey - sr * ex) * ky;
+#if MCUVG_V2
+    if (p->focal) {
+        float fx = p->fx - p->x0, fy = p->fy - p->y0;
+        float u = (cr * fx + sr * fy) * kx, v = (cr * fy - sr * fx) * ky, fr = p->fr > 0 ? p->fr * kx : 0.0f;
+        if (fr > 0.9f) fr = 0.9f;
+        float lim = 0.995f * (1.0f - fr), l = mcuvg_sqrt(u * u + v * v);
+        if (l > lim) { u *= lim / l; v *= lim / l; }               /* outside the circle: onto its edge (SVG 1.1) */
+        q->focal = 1;
+        q->fx = u; q->fy = v; q->fr = fr; q->dr = 1.0f - fr;
+        q->fa = u * u + v * v - q->dr * q->dr;                      /* < 0: the focal circle is inside */
+    }
+#endif
     return 0;
 }
 
@@ -500,16 +533,56 @@ static inline uint32_t rgb565(uint32_t r, uint32_t g, uint32_t b)
 }
 #define ARGB565(p) rgb565(((p) >> 16) & 255u, ((p) >> 8) & 255u, (p) & 255u)
 
+#if MCUVG_V2
+/* version 2: t brought into 0..1 by the spread; NO_T (a point the focal gradient does not reach) is transparent */
+#define NO_T (-1e30f)
+static inline __attribute__((always_inline)) uint32_t lut_sp(const uint32_t *lut, float t, int spread)
+{
+    if (t == NO_T) return 0;
+    if (spread == MCUVG_REPEAT) t -= (float)ifloor(t);
+    else if (spread == MCUVG_REFLECT) {
+        t = fabs_(t);
+        int k = ifloor(t);
+        t -= (float)k;
+        if (k & 1) t = 1.0f - t;
+    }
+    return lut_at(lut, t);
+}
+/* the focal gradient's t at (u, v) of the unit circle: the largest t whose circle - centre f + t (0 - f), radius
+   fr + t (1 - fr) - passes through the point; fa < 0 (the focal circle inside) makes it one root */
+static inline __attribute__((always_inline)) float focal_t(float u, float v, float fx, float fy, float fr, float fa, float dr)
+{
+    float qx = u - fx, qy = v - fy;
+    float b = fr * dr - (qx * fx + qy * fy), c0 = qx * qx + qy * qy - fr * fr, disc = b * b - fa * c0;
+    if (disc < 0) disc = 0;
+    return (b - mcuvg_sqrt(disc)) / fa;
+}
+#endif
+
+static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv);
+#if MCUVG_V2
+static void out_run_mask(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv);
+#endif
+
 static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
 {
+#if MCUVG_V2
+    if (c->mask) { out_run_mask(c, q, lut, x0, x1, y, cv); return; }
+#endif
     int n = x1 - x0;
     const int lin = q->kind == MCUVG_LINEAR;
     const float ga = q->ga, gb = q->gb, gc = q->gc;
-    const float ia = q->ia, ib = q->ib, ic = q->ic, id = q->id, ie = q->ie, iff = q->iff;
-    const float gcx = q->cx, gcy = q->cy, rinv = q->rinv;
+    const float ua = q->ua, ub = q->ub, uc = q->uc, ud = q->ud, ue = q->ue, uf = q->uf;
+#if MCUVG_V2
+    const int spread = q->spread, focal = q->focal;
+    const float ffx = q->fx, ffy = q->fy, ffr = q->fr, ffa = q->fa, fdr = q->dr;
+#define RAD_T(U, V) (focal ? focal_t((U), (V), ffx, ffy, ffr, ffa, fdr) : mcuvg_sqrt((U) * (U) + (V) * (V)))
+#define PAINT(X) lut_sp(lut, lin ? ga * (X) + gb * fy + gc : RAD_T(ua * (X) + uc * fy + ue, ub * (X) + ud * fy + uf), spread)
+#else
 #define PAINT(X) (lin ? lut_at(lut, ga * (X) + gb * fy + gc) \
-                      : lut_at(lut, mcuvg_sqrt((ia * (X) + ic * fy + ie - gcx) * (ia * (X) + ic * fy + ie - gcx) + \
-                                               (ib * (X) + id * fy + iff - gcy) * (ib * (X) + id * fy + iff - gcy)) * rinv))
+                      : lut_at(lut, mcuvg_sqrt((ua * (X) + uc * fy + ue) * (ua * (X) + uc * fy + ue) + \
+                                               (ub * (X) + ud * fy + uf) * (ub * (X) + ud * fy + uf))))
+#endif
     uint8_t *rowp = (uint8_t *)c->px + (size_t)y * (size_t)c->stride;
     uint32_t f = q->kind == MCUVG_FLAT ? (cv == 256u ? q->flat : scale_px(q->flat, cv)) : 0u;
     int flat = q->kind == MCUVG_FLAT;
@@ -582,6 +655,9 @@ static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int 
 }
 
 #undef PAINT
+#if MCUVG_V2
+#undef RAD_T
+#endif
 
 /* the flat-colour RGB565 case (icons, an application's raster) without a call per pixel: inlined into the sweep, so
    the colour and the row stay in registers (a call with its spills costs more than the pixel on an uncached core) */
@@ -749,7 +825,11 @@ static int raster(mcuvg_ctx *c, const struct pnt *q, int rule)
                        c, q, lut_of(c), xa };
     uint32_t o565 = ARGB565(r.fl);
     r.v565 = r.sw ? ((o565 & 255u) << 8) | (o565 >> 8) : o565;
+#if MCUVG_V2
+    const int f565 = q->kind == MCUVG_FLAT && (c->fmt == MCUVG_RGB565 || r.sw) && !c->mask;   /* a clip: per pixel */
+#else
     const int f565 = q->kind == MCUVG_FLAT && (c->fmt == MCUVG_RGB565 || r.sw);
+#endif
     const mcuvg_edge *E = c->e;
     uint16_t *act = c->act;
     const uint32_t ne = c->ne;
@@ -899,6 +979,88 @@ static void cap_at(struct ol *o, float x, float y, float dx, float dy, const str
     ol_to(o, x - nx, y - ny);
 }
 
+/* a dot - a subpath of one point or a zero-length piece: drawn by the round and the square caps only (as SVG does) */
+static void dot(struct ol *o, float x, float y, const struct stk *k)
+{
+    if (k->cap == MCUVG_ROUND) {
+        ol_to(o, x + k->hw, y);
+        ol_arc(o, x, y, k->hw, 1, 0, 2 * PI_F, k->tol);
+        ol_close(o);
+    } else if (k->cap == MCUVG_SQUARE) {
+        ol_to(o, x - k->hw, y - k->hw); ol_to(o, x + k->hw, y - k->hw);
+        ol_to(o, x + k->hw, y + k->hw); ol_to(o, x - k->hw, y + k->hw);
+        ol_close(o);
+    }
+}
+
+/* an open polyline pp[0..n-1], n >= 2: one side, the end cap, the other side back, the start cap */
+static void open_line(struct ol *o, const float *pp, int n, const struct stk *k)
+{
+    const float *last = pp + 2 * (n - 1);
+    float dx = last[0] - last[-2], dy = last[1] - last[-1], l = mcuvg_sqrt(dx * dx + dy * dy);
+    float sx = pp[0] - pp[2], sy = pp[1] - pp[3], sl = mcuvg_sqrt(sx * sx + sy * sy);
+    side(o, pp, n, 2, 0, k);
+    if (l > 0) cap_at(o, last[0], last[1], dx / l, dy / l, k);
+    side(o, last, n, -2, 0, k);
+    if (sl > 0) cap_at(o, pp[0], pp[1], sx / sl, sy / sl, k);
+    ol_close(o);
+}
+
+#if MCUVG_V2
+/* version 2: the dashes of one subpath pp[0..n-1] (device points; closed: its last point joins the first).  Each dash
+   is built in the free tail of the point store and outlined as an open line; the pattern runs on across vertices and
+   subpaths' corners as SVG's does.  -1: the tail is too short for a dash */
+static int dashes(mcuvg_ctx *c, struct ol *o, const float *pp, int n, int closed, const struct stk *k)
+{
+    float d[MCUVG_DASHES], total = 0, scale = mat_scale(&c->m);
+    int nd = c->ndash;
+    for (int i = 0; i < nd; i++) { d[i] = c->dash[i] * scale; total += d[i]; }
+    if (!(total > 0)) return 1;                                         /* no pattern: the caller draws it solid */
+    float *buf = c->pt + 2u * c->npt;
+    uint32_t room = c->cappt - c->npt, np = 0;
+    float pos = c->dash_off * scale;
+    pos -= total * (float)ifloor(pos / total);
+    int idx = 0;
+    while (pos > 0 && pos >= d[idx]) { pos -= d[idx]; idx = (idx + 1) % nd; }
+    float rem = d[idx] - pos;
+    int segs = closed ? n : n - 1;
+    for (int i = 0; i < segs; i++) {
+        float ax = pp[2 * i], ay = pp[2 * i + 1];
+        const float *b = pp + 2 * ((i + 1) % n);
+        float dx = b[0] - ax, dy = b[1] - ay, L = mcuvg_sqrt(dx * dx + dy * dy), t = 0;
+        if (L == 0) continue;
+        dx /= L; dy /= L;
+        for (;;) {
+            if (rem <= 1e-6f) {                                         /* an element ends here, or is empty */
+                if (!(idx & 1)) {                                       /* a dash: out with it; an empty one is a dot */
+                    if (np >= 2 && (buf[0] != buf[2 * np - 2] || buf[1] != buf[2 * np - 1])) open_line(o, buf, (int)np, k);
+                    else dot(o, np ? buf[0] : ax + dx * t, np ? buf[1] : ay + dy * t, k);
+                    np = 0;
+                }
+                idx = (idx + 1) % nd;                                   /* total > 0: a long element comes */
+                rem = d[idx];
+                continue;
+            }
+            if (t >= L) break;
+            float step = rem < L - t ? rem : L - t;
+            if (!(idx & 1)) {                                           /* inside a dash */
+                if (np == 0) {
+                    if (room < 2) return -1;
+                    buf[0] = ax + dx * t; buf[1] = ay + dy * t; np = 1;
+                }
+                if (np >= room) return -1;
+                buf[2 * np] = ax + dx * (t + step); buf[2 * np + 1] = ay + dy * (t + step); np++;
+            }
+            t += step;
+            rem -= step;
+        }
+    }
+    if (np >= 2) open_line(o, buf, (int)np, k);
+    else if (np == 1) dot(o, buf[0], buf[1], k);
+    return 0;
+}
+#endif
+
 int mcuvg_stroke(mcuvg_ctx *c, const mcuvg_paint *p, float width, int cap, int join, float miter_limit)
 {
     if (c->full) return MCUVG_E_FULL;
@@ -915,32 +1077,22 @@ int mcuvg_stroke(mcuvg_ctx *c, const mcuvg_paint *p, float width, int cap, int j
         int n = (int)(i - s), closed = i < c->npt && c->pt[2u * i + 1u] != 0.0f;
         const float *pp = c->pt + 2u * s;
         if (closed && n > 2 && pp[0] == pp[2 * (n - 1)] && pp[1] == pp[2 * (n - 1) + 1]) n--;   /* "L start Z" */
+#if MCUVG_V2
+        int dr = c->ndash && n >= 2 ? dashes(c, &o, pp, n, closed, &k) : 1;
+        if (dr < 0) return MCUVG_E_FULL;
+        if (dr == 0) { if (o.err) return MCUVG_E_FULL; if (i < c->npt) i++; continue; }
+#endif
         if (n == 1 || (n == 2 && pp[0] == pp[2] && pp[1] == pp[3])) {
-            /* a dot: drawn by the round and the square caps only (as SVG does) */
-            if (cap == MCUVG_ROUND) {
-                ol_to(&o, pp[0] + k.hw, pp[1]);
-                ol_arc(&o, pp[0], pp[1], k.hw, 1, 0, 2 * PI_F, k.tol);
-                ol_close(&o);
-            } else if (cap == MCUVG_SQUARE) {
-                ol_to(&o, pp[0] - k.hw, pp[1] - k.hw); ol_to(&o, pp[0] + k.hw, pp[1] - k.hw);
-                ol_to(&o, pp[0] + k.hw, pp[1] + k.hw); ol_to(&o, pp[0] - k.hw, pp[1] + k.hw);
-                ol_close(&o);
-            }
+            dot(&o, pp[0], pp[1], &k);
         } else if (n >= 2) {
-            const float *last = pp + 2 * (n - 1);
             if (closed) {
+                const float *last = pp + 2 * (n - 1);
                 side(&o, pp, n, 2, 1, &k);
                 ol_close(&o);
                 side(&o, last, n, -2, 1, &k);
                 ol_close(&o);
             } else {
-                float dx = last[0] - last[-2], dy = last[1] - last[-1], l = mcuvg_sqrt(dx * dx + dy * dy);
-                float sx = pp[0] - pp[2], sy = pp[1] - pp[3], sl = mcuvg_sqrt(sx * sx + sy * sy);
-                side(&o, pp, n, 2, 0, &k);
-                if (l > 0) cap_at(&o, last[0], last[1], dx / l, dy / l, &k);
-                side(&o, last, n, -2, 0, &k);
-                if (sl > 0) cap_at(&o, pp[0], pp[1], sx / sl, sy / sl, &k);
-                ol_close(&o);
+                open_line(&o, pp, n, &k);
             }
         }
         if (o.err) return MCUVG_E_FULL;
@@ -949,3 +1101,403 @@ int mcuvg_stroke(mcuvg_ctx *c, const mcuvg_paint *p, float width, int cap, int j
     if (o.err) return MCUVG_E_FULL;
     return raster(c, &q, MCUVG_NONZERO);
 }
+
+#if MCUVG_V2
+/* ==== version 2: clips, groups, shadows, blur ========================================================================
+   Coordinates: a layer is a window onto the first target (the one given to mcuvg_init); c->ox, c->oy is the corner of
+   the target being drawn into, in the first target's pixels, so masks and layers line up whatever the nesting.  Every
+   box is clipped to the target it is drawn from, so a layer is never wider than the first target and the row buffers
+   made for it serve every layer. */
+
+void mcuvg_layers(mcuvg_ctx *c, void *mem, size_t len)
+{
+    uint8_t *p = (uint8_t *)(((uintptr_t)mem + 7u) & ~(uintptr_t)7u);
+    size_t skip = (size_t)(p - (uint8_t *)mem);
+    c->lm = mem && len > skip ? p : 0;
+    c->llen = mem && len > skip ? len - skip : 0;
+    c->lused = 0;
+}
+
+static uint8_t *lalloc(mcuvg_ctx *c, size_t n)            /* zeroed */
+{
+    n = align8(n);
+    if (!c->lm || n > c->llen - c->lused) return 0;
+    uint8_t *p = c->lm + c->lused;
+    c->lused += n;
+    uint32_t *w = (uint32_t *)(void *)p;
+    for (size_t i = 0; i < n / 4u; i++) w[i] = 0;
+    return p;
+}
+
+int mcuvg_dash(mcuvg_ctx *c, const float *len, int n, float offset)
+{
+    c->ndash = 0;
+    c->dash_off = offset;
+    if (!len || n <= 0) return MCUVG_OK;
+    int m = n & 1 ? 2 * n : n;                                     /* an odd list is repeated (SVG) */
+    if (m > MCUVG_DASHES) return MCUVG_E_ARG;
+    float total = 0;
+    for (int i = 0; i < m; i++) {
+        float v = len[i % n];
+        if (v < 0) return MCUVG_E_ARG;
+        c->dash[i] = v;
+        total += v;
+    }
+    if (total > 0) c->ndash = m;
+    return MCUVG_OK;
+}
+
+/* the 8-bit mask in force at the first target's pixel (X, Y): 255 outside every clip */
+static inline uint32_t mask_at(const mcuvg_ctx *c, int X, int Y)
+{
+    int u = X - c->mx0, v = Y - c->my0;
+    return u >= 0 && v >= 0 && u < c->mw && v < c->mh ? c->mask[v * c->mw + u] : 0u;
+}
+
+/* n premultiplied pixels "over" row y of the target from x0 (the target's own pixels) */
+static void blend_row(mcuvg_ctx *c, int x0, int y, int n, const uint32_t *s)
+{
+    uint8_t *rowp = (uint8_t *)c->px + (size_t)y * (size_t)c->stride;
+    switch (c->fmt) {
+    case MCUVG_RGB565:
+    case MCUVG_RGB565_SWAP: {
+        uint16_t *d = (uint16_t *)(void *)rowp + x0;
+        int sw = c->fmt == MCUVG_RGB565_SWAP;
+        for (int i = 0; i < n; i++) {
+            uint32_t p = s[i], sa = p >> 24, k = 255u - sa;
+            if (!sa) continue;
+            uint32_t v = d[i];
+            if (sw) v = ((v & 255u) << 8) | (v >> 8);
+            uint32_t r = (v >> 11) & 31u, g = (v >> 5) & 63u, b = v & 31u;
+            r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2);
+            r = ((p >> 16) & 255u) + (r * k + 127u) / 255u;
+            g = ((p >> 8) & 255u) + (g * k + 127u) / 255u;
+            b = (p & 255u) + (b * k + 127u) / 255u;
+            v = rgb565(r > 255u ? 255u : r, g > 255u ? 255u : g, b > 255u ? 255u : b);
+            d[i] = (uint16_t)(sw ? ((v & 255u) << 8) | (v >> 8) : v);
+        }
+        return;
+    }
+    case MCUVG_RGBA8888: {
+        uint8_t *d = rowp + (size_t)x0 * 4u;
+        for (int i = 0; i < n; i++, d += 4) {
+            uint32_t p = s[i], sa = p >> 24, k = 255u - sa;
+            if (!sa) continue;
+            d[0] = (uint8_t)(((p >> 16) & 255u) + (d[0] * k + 127u) / 255u);
+            d[1] = (uint8_t)(((p >> 8) & 255u) + (d[1] * k + 127u) / 255u);
+            d[2] = (uint8_t)((p & 255u) + (d[2] * k + 127u) / 255u);
+            d[3] = (uint8_t)(sa + (d[3] * k + 127u) / 255u);
+        }
+        return;
+    }
+    case MCUVG_A8: {
+        uint8_t *d = rowp + x0;
+        for (int i = 0; i < n; i++) {
+            uint32_t sa = s[i] >> 24;
+            d[i] = (uint8_t)(sa + (d[i] * (255u - sa) + 127u) / 255u);
+        }
+        return;
+    }
+    default:
+        if (c->span) c->span(c->user, x0, y, n, s);
+        return;
+    }
+}
+
+/* one pixel of paint q at (X, fy): premultiplied */
+static uint32_t paint_px(const struct pnt *q, const uint32_t *lut, float X, float fy)
+{
+    if (q->kind == MCUVG_FLAT) return q->flat;
+    if (q->kind == MCUVG_LINEAR) return lut_sp(lut, q->ga * X + q->gb * fy + q->gc, q->spread);
+    float u = q->ua * X + q->uc * fy + q->ue, v = q->ub * X + q->ud * fy + q->uf;
+    return lut_sp(lut, q->focal ? focal_t(u, v, q->fx, q->fy, q->fr, q->fa, q->dr) : mcuvg_sqrt(u * u + v * v), q->spread);
+}
+
+/* out_run under a clip: the paint and the coverage times the mask, pixel by pixel, then over the target */
+static void out_run_mask(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
+{
+    float fy = (float)y + 0.5f;
+    while (x0 < x1) {
+        int n = x1 - x0 < c->w ? x1 - x0 : c->w;
+        for (int i = 0; i < n; i++) {
+            uint32_t m = mask_at(c, x0 + i + c->ox, y + c->oy), k = (cv * m + 127u) / 255u;
+            c->pix[i] = k ? scale_px(paint_px(q, lut, (float)(x0 + i) + 0.5f, fy), k) : 0u;
+        }
+        blend_row(c, x0, y, n, c->pix);
+        x0 += n;
+    }
+}
+
+/* ---- boxes ---------------------------------------------------------------------------------------------------------- */
+
+struct box { int x, y, w, h; };                            /* the first target's pixels */
+
+/* the user box (x0, y0, x1, y1) through the matrix, grown by g pixels, inside the target's clip: empty w or h <= 0 */
+static struct box dev_box(const mcuvg_ctx *c, float x0, float y0, float x1, float y1, float g)
+{
+    float X[4], Y[4];
+    xf(c, x0, y0, &X[0], &Y[0]); xf(c, x1, y0, &X[1], &Y[1]);
+    xf(c, x0, y1, &X[2], &Y[2]); xf(c, x1, y1, &X[3], &Y[3]);
+    float a = X[0], b = X[0], e = Y[0], f = Y[0];
+    for (int i = 1; i < 4; i++) { a = fmin_(a, X[i]); b = fmax_(b, X[i]); e = fmin_(e, Y[i]); f = fmax_(f, Y[i]); }
+    int bx0 = ifloor(a - g) - 1, bx1 = iceil(b + g) + 1, by0 = ifloor(e - g) - 1, by1 = iceil(f + g) + 1;
+    if (bx0 < c->cx0) bx0 = c->cx0;
+    if (by0 < c->cy0) by0 = c->cy0;
+    if (bx1 > c->cx1) bx1 = c->cx1;
+    if (by1 > c->cy1) by1 = c->cy1;
+    struct box r = { bx0 + c->ox, by0 + c->oy, bx1 - bx0, by1 - by0 };
+    return r;
+}
+
+/* ---- the frames: a shadow pass or a group in progress ------------------------------------------------------------- */
+
+static struct mcuvg_frame *push(mcuvg_ctx *c, int pass, const mcuvg_group *g)
+{
+    if (c->depth >= MCUVG_DEPTH) return 0;
+    struct mcuvg_frame *f = &c->fr[c->depth++];
+    f->px = c->px; f->w = c->w; f->h = c->h; f->stride = c->stride; f->fmt = c->fmt;
+    f->cx0 = c->cx0; f->cy0 = c->cy0; f->cx1 = c->cx1; f->cy1 = c->cy1; f->ox = c->ox; f->oy = c->oy;
+    f->span = c->span; f->user = c->user;
+    f->mask = c->mask; f->mx0 = c->mx0; f->my0 = c->my0; f->mw = c->mw; f->mh = c->mh;
+    f->m = c->m;
+    f->lused = c->lused;
+    f->layer = 0; f->lx = f->ly = f->lw = f->lh = 0;
+    f->pass = pass;
+    if (g) f->g = *g;
+    return f;
+}
+
+static void restore(mcuvg_ctx *c, const struct mcuvg_frame *f)   /* the target, clip, mask and matrix of before */
+{
+    c->px = f->px; c->w = f->w; c->h = f->h; c->stride = f->stride; c->fmt = f->fmt;
+    c->cx0 = f->cx0; c->cy0 = f->cy0; c->cx1 = f->cx1; c->cy1 = f->cy1; c->ox = f->ox; c->oy = f->oy;
+    c->span = f->span; c->user = f->user;
+    c->mask = f->mask; c->mx0 = f->mx0; c->my0 = f->my0; c->mw = f->mw; c->mh = f->mh;
+    c->m = f->m;
+}
+
+/* draw into the layer buf (box b, bpp bytes a pixel) from now on: the matrix moved by the layer's corner */
+static void retarget(mcuvg_ctx *c, uint8_t *buf, const struct box *b, int fmt, int bpp)
+{
+    c->m.e -= (float)(b->x - c->ox);
+    c->m.f -= (float)(b->y - c->oy);
+    c->px = buf; c->w = b->w; c->h = b->h; c->stride = b->w * bpp; c->fmt = fmt;
+    c->cx0 = 0; c->cy0 = 0; c->cx1 = b->w; c->cy1 = b->h; c->ox = b->x; c->oy = b->y;
+    c->span = 0; c->user = 0;
+}
+
+static void draw_nothing(mcuvg_ctx *c) { c->cx1 = c->cx0; c->cy1 = c->cy0; }
+
+/* ---- blur: three box blurs, each a running sum (the cost does not grow with the radius) --------------------------- */
+
+static void box_radii(float sigma, int r[3])
+{
+    float wi = mcuvg_sqrt(4.0f * sigma * sigma + 1.0f);         /* sqrt(12 s^2 / 3 + 1) */
+    int wl = (int)wi;
+    if (!(wl & 1)) wl--;
+    if (wl < 1) wl = 1;
+    float mi = (12.0f * sigma * sigma - 3.0f * (float)(wl * wl) - 12.0f * (float)wl - 9.0f) / (-4.0f * (float)wl - 4.0f);
+    int m = (int)(mi + 0.5f);
+    for (int i = 0; i < 3; i++) r[i] = ((i < m ? wl : wl + 2) - 1) / 2;
+}
+
+/* one line of n values at step bytes, a box of radius r; outside is 0.  tmp: n bytes */
+static void blur_line(uint8_t *p, int n, int step, int r, uint8_t *tmp)
+{
+    for (int i = 0; i < n; i++) tmp[i] = p[i * step];
+    uint32_t w = 2u * (uint32_t)r + 1u, inv = (65536u + w / 2u) / w, sum = 0;
+    for (int i = 0; i <= r && i < n; i++) sum += tmp[i];
+    for (int x = 0; x < n; x++) {
+        p[x * step] = (uint8_t)((sum * inv + 32768u) >> 16);
+        if (x + r + 1 < n) sum += tmp[x + r + 1];
+        if (x - r >= 0) sum -= tmp[x - r];
+    }
+}
+
+static void blur(uint8_t *buf, int w, int h, int bpp, float sigma, uint8_t *tmp)
+{
+    if (!(sigma > 0.2f)) return;
+    int r[3];
+    box_radii(sigma, r);
+    for (int k = 0; k < 3; k++) {
+        if (!r[k]) continue;
+        for (int y = 0; y < h; y++)
+            for (int ch = 0; ch < bpp; ch++) blur_line(buf + (size_t)y * (size_t)(w * bpp) + ch, w, bpp, r[k], tmp);
+        for (int x = 0; x < w; x++)
+            for (int ch = 0; ch < bpp; ch++) blur_line(buf + (size_t)x * (size_t)bpp + ch, h, w * bpp, r[k], tmp);
+    }
+}
+
+/* ---- the shadow pass ------------------------------------------------------------------------------------------------ */
+
+int mcuvg_shadow_begin(mcuvg_ctx *c, const mcuvg_group *g)
+{
+    if (!g || g->nshadow > MCUVG_SHADOWS) return MCUVG_E_ARG;
+    struct mcuvg_frame *f = push(c, 1, g);
+    if (!f) return MCUVG_E_FULL;
+    c->mask = 0;                                    /* the clip in force applies when the shadow is laid, not here */
+    struct box b = dev_box(c, g->x0, g->y0, g->x1, g->y1, 0);
+    if (b.w <= 0 || b.h <= 0) { draw_nothing(c); return MCUVG_OK; }
+    uint8_t *buf = lalloc(c, (size_t)b.w * (size_t)b.h);
+    if (!buf) { c->depth--; restore(c, f); return MCUVG_E_FULL; }
+    f->layer = buf; f->lx = b.x; f->ly = b.y; f->lw = b.w; f->lh = b.h;
+    retarget(c, buf, &b, MCUVG_A8, 1);              /* the group's alpha: everything it draws, as coverage */
+    return MCUVG_OK;
+}
+
+int mcuvg_shadow_end(mcuvg_ctx *c)
+{
+    if (!c->depth || c->fr[c->depth - 1].pass != 1) return MCUVG_E_ARG;
+    struct mcuvg_frame *f = &c->fr[c->depth - 1];
+    restore(c, f);
+    int rc = MCUVG_OK;
+    if (f->layer) {
+        float sc = mat_scale(&c->m);
+        for (uint32_t s = 0; s < f->g.nshadow && rc == MCUVG_OK; s++) {
+            const mcuvg_shadow *sh = &f->g.shadow[s];
+            float sig = sh->sigma * sc;
+            float odx = c->m.a * sh->dx + c->m.c * sh->dy, ody = c->m.b * sh->dx + c->m.d * sh->dy;
+            int ox = (int)(odx + (odx >= 0 ? 0.5f : -0.5f)), oy = (int)(ody + (ody >= 0 ? 0.5f : -0.5f));
+            int g = iceil(3.0f * sig) + 1;
+            /* the shadow's box: the group's, moved and grown by the blur's reach, inside the target */
+            int sx0 = f->lx + ox - g, sy0 = f->ly + oy - g, sx1 = f->lx + ox + f->lw + g, sy1 = f->ly + oy + f->lh + g;
+            if (sx0 < c->ox + c->cx0) sx0 = c->ox + c->cx0;
+            if (sy0 < c->oy + c->cy0) sy0 = c->oy + c->cy0;
+            if (sx1 > c->ox + c->cx1) sx1 = c->ox + c->cx1;
+            if (sy1 > c->oy + c->cy1) sy1 = c->oy + c->cy1;
+            if (sx0 >= sx1 || sy0 >= sy1) continue;
+            /* blurred over that box grown by the reach once more, so its edges see all the alpha that reaches them */
+            int bx0 = sx0 - g, by0 = sy0 - g, bw = sx1 - sx0 + 2 * g, bh = sy1 - sy0 + 2 * g;
+            size_t mark = c->lused;
+            uint8_t *a = lalloc(c, (size_t)bw * (size_t)bh), *tmp = lalloc(c, (size_t)(bw > bh ? bw : bh));
+            if (!a || !tmp) { rc = MCUVG_E_FULL; c->lused = mark; break; }
+            for (int y = 0; y < f->lh; y++) {               /* the alpha, moved by the offset */
+                int Y = f->ly + oy + y - by0;
+                if (Y < 0 || Y >= bh) continue;
+                for (int x = 0; x < f->lw; x++) {
+                    int X = f->lx + ox + x - bx0;
+                    if (X >= 0 && X < bw) a[Y * bw + X] = f->layer[y * f->lw + x];
+                }
+            }
+            blur(a, bw, bh, 1, sig, tmp);
+            uint32_t col = premul(sh->color);
+            for (int Y = sy0; Y < sy1; Y++) {
+                int n = sx1 - sx0;
+                for (int i = 0; i < n; i++) {
+                    uint32_t v = a[(Y - by0) * bw + (sx0 + i - bx0)];
+                    if (c->mask && v) v = (v * mask_at(c, sx0 + i, Y) + 127u) / 255u;
+                    c->pix[i] = v ? scale_px(col, v + (v >> 7)) : 0u;     /* v 0..255 -> 0..256 */
+                }
+                blend_row(c, sx0 - c->ox, Y - c->oy, n, c->pix);
+            }
+            c->lused = mark;
+        }
+    }
+    c->lused = f->lused;
+    c->depth--;
+    return rc;
+}
+
+/* ---- the group ------------------------------------------------------------------------------------------------------ */
+
+int mcuvg_group_begin(mcuvg_ctx *c, const mcuvg_group *g)
+{
+    if (!g) return MCUVG_E_ARG;
+    struct mcuvg_frame *f = push(c, 2, g);
+    if (!f) return MCUVG_E_FULL;
+    if (!(g->opacity < 0.999f) && !(g->blur > 0)) return MCUVG_OK;     /* a clip alone: drawn straight, through it */
+    float sig = g->blur > 0 ? g->blur * mat_scale(&c->m) : 0.0f;
+    struct box b = dev_box(c, g->x0, g->y0, g->x1, g->y1, sig > 0 ? 3.0f * sig + 1.0f : 0.0f);
+    if (b.w <= 0 || b.h <= 0 || !(g->opacity > 0.001f)) { draw_nothing(c); return MCUVG_OK; }
+    uint8_t *buf = lalloc(c, (size_t)b.w * (size_t)b.h * 4u);
+    if (!buf) { c->depth--; restore(c, f); return MCUVG_E_FULL; }
+    f->layer = buf; f->lx = b.x; f->ly = b.y; f->lw = b.w; f->lh = b.h;
+    c->mask = 0;                                   /* the clip in force applies to the layer as a whole, at its end */
+    retarget(c, buf, &b, MCUVG_RGBA8888, 4);
+    return MCUVG_OK;
+}
+
+int mcuvg_clip_path(mcuvg_ctx *c, int rule)
+{
+    if (!c->depth || c->fr[c->depth - 1].pass == 0) return MCUVG_E_ARG;
+    if (c->full) return MCUVG_E_FULL;
+    if (!c->npt) { draw_nothing(c); return MCUVG_OK; }
+    float a = 1e30f, b = -1e30f, e = 1e30f, f = -1e30f;
+    for (uint32_t i = 0; i < c->npt; i++) {
+        float x = c->pt[2 * i], y = c->pt[2 * i + 1];
+        if (x == MARK) continue;
+        a = fmin_(a, x); b = fmax_(b, x); e = fmin_(e, y); f = fmax_(f, y);
+    }
+    int x0 = ifloor(a), x1 = iceil(b) + 1, y0 = ifloor(e), y1 = iceil(f) + 1;
+    if (x0 < c->cx0) x0 = c->cx0;
+    if (y0 < c->cy0) y0 = c->cy0;
+    if (x1 > c->cx1) x1 = c->cx1;
+    if (y1 > c->cy1) y1 = c->cy1;
+    struct box m = { x0 + c->ox, y0 + c->oy, x1 - x0, y1 - y0 };
+    if (c->mask) {                                       /* inside the clip already in force */
+        int ax = m.x > c->mx0 ? m.x : c->mx0, ay = m.y > c->my0 ? m.y : c->my0;
+        int bx = m.x + m.w < c->mx0 + c->mw ? m.x + m.w : c->mx0 + c->mw;
+        int by = m.y + m.h < c->my0 + c->mh ? m.y + m.h : c->my0 + c->mh;
+        m.x = ax; m.y = ay; m.w = bx - ax; m.h = by - ay;
+    }
+    if (m.w <= 0 || m.h <= 0) { draw_nothing(c); return MCUVG_OK; }
+    uint8_t *buf = lalloc(c, (size_t)m.w * (size_t)m.h);
+    if (!buf) return MCUVG_E_FULL;
+    /* the path's coverage into the mask: its points moved to the mask's corner, drawn into it as A8, moved back */
+    float dx = (float)(m.x - c->ox), dy = (float)(m.y - c->oy);
+    for (uint32_t i = 0; i < c->npt; i++) if (c->pt[2 * i] != MARK) { c->pt[2 * i] -= dx; c->pt[2 * i + 1] -= dy; }
+    struct mcuvg_frame save;
+    save.px = c->px; save.w = c->w; save.h = c->h; save.stride = c->stride; save.fmt = c->fmt;
+    save.cx0 = c->cx0; save.cy0 = c->cy0; save.cx1 = c->cx1; save.cy1 = c->cy1; save.ox = c->ox; save.oy = c->oy;
+    save.span = c->span; save.user = c->user;
+    save.mask = c->mask; save.mx0 = c->mx0; save.my0 = c->my0; save.mw = c->mw; save.mh = c->mh; save.m = c->m;
+    c->px = buf; c->w = m.w; c->h = m.h; c->stride = m.w; c->fmt = MCUVG_A8;
+    c->cx0 = 0; c->cy0 = 0; c->cx1 = m.w; c->cy1 = m.h; c->ox = m.x; c->oy = m.y; c->span = 0; c->mask = 0;
+    mcuvg_paint white = { MCUVG_FLAT, 0, 0xFFFFFFFFu, 0, 0, 0, 0, { 0 }, { 0 }, 0, 0, 0, 0, 0, 0, 0 };
+    int rc = mcuvg_fill(c, &white, rule);
+    restore(c, &save);
+    for (uint32_t i = 0; i < c->npt; i++) if (c->pt[2 * i] != MARK) { c->pt[2 * i] += dx; c->pt[2 * i + 1] += dy; }
+    if (rc) return rc;
+    if (c->mask)                                          /* the intersection: the new coverage times the old */
+        for (int y = 0; y < m.h; y++)
+            for (int x = 0; x < m.w; x++) {
+                uint8_t *p = &buf[y * m.w + x];
+                *p = (uint8_t)((*p * mask_at(c, m.x + x, m.y + y) + 127u) / 255u);
+            }
+    c->mask = buf; c->mx0 = m.x; c->my0 = m.y; c->mw = m.w; c->mh = m.h;
+    return MCUVG_OK;
+}
+
+int mcuvg_group_end(mcuvg_ctx *c)
+{
+    if (!c->depth || c->fr[c->depth - 1].pass != 2) return MCUVG_E_ARG;
+    struct mcuvg_frame *f = &c->fr[c->depth - 1];
+    restore(c, f);
+    if (f->layer) {
+        if (f->g.blur > 0) {
+            uint8_t *tmp = lalloc(c, (size_t)(f->lw > f->lh ? f->lw : f->lh));
+            if (tmp) blur(f->layer, f->lw, f->lh, 4, f->g.blur * mat_scale(&c->m), tmp);
+        }
+        uint32_t k = (uint32_t)(f->g.opacity * 256.0f + 0.5f);
+        if (k > 256u) k = 256u;
+        int x0 = f->lx, x1 = f->lx + f->lw, y0 = f->ly, y1 = f->ly + f->lh;   /* inside the restored target */
+        if (x0 < c->ox + c->cx0) x0 = c->ox + c->cx0;
+        if (y0 < c->oy + c->cy0) y0 = c->oy + c->cy0;
+        if (x1 > c->ox + c->cx1) x1 = c->ox + c->cx1;
+        if (y1 > c->oy + c->cy1) y1 = c->oy + c->cy1;
+        for (int Y = y0; Y < y1; Y++) {
+            const uint8_t *s = f->layer + ((size_t)(Y - f->ly) * (size_t)f->lw + (size_t)(x0 - f->lx)) * 4u;
+            for (int i = 0; i < x1 - x0; i++, s += 4) {
+                uint32_t p = (uint32_t)s[3] << 24 | (uint32_t)s[0] << 16 | (uint32_t)s[1] << 8 | s[2];
+                uint32_t kk = k;
+                if (c->mask) kk = (k * mask_at(c, x0 + i, Y) + 127u) / 255u;
+                c->pix[i] = p ? scale_px(p, kk) : 0u;
+            }
+            blend_row(c, x0 - c->ox, Y - c->oy, x1 - x0, c->pix);
+        }
+    }
+    c->lused = f->lused;
+    c->depth--;
+    return MCUVG_OK;
+}
+#endif

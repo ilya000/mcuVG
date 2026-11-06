@@ -25,7 +25,21 @@ JOINS = {"miter": 0, "miter-clip": 0, "arcs": 0, "round": 1, "bevel": 2}
 class Paint(C.Structure):
     _fields_ = [("kind", C.c_uint8), ("n", C.c_uint8), ("color", C.c_uint32),
                 ("x0", C.c_float), ("y0", C.c_float), ("x1", C.c_float), ("y1", C.c_float),
-                ("off", C.c_float * 8), ("col", C.c_uint32 * 8)]
+                ("off", C.c_float * 8), ("col", C.c_uint32 * 8),
+                ("spread", C.c_uint8), ("focal", C.c_uint8), ("ry", C.c_float), ("rot", C.c_float),
+                ("fx", C.c_float), ("fy", C.c_float), ("fr", C.c_float)]
+
+
+class Shadow(C.Structure):
+    _fields_ = [("dx", C.c_float), ("dy", C.c_float), ("sigma", C.c_float), ("color", C.c_uint32)]
+
+
+class Group(C.Structure):
+    _fields_ = [("x0", C.c_float), ("y0", C.c_float), ("x1", C.c_float), ("y1", C.c_float),
+                ("opacity", C.c_float), ("blur", C.c_float), ("nshadow", C.c_uint32), ("shadow", Shadow * 4)]
+
+
+SPREAD = {"pad": 0, "reflect": 1, "repeat": 2}
 
 
 class Mat(C.Structure):
@@ -50,12 +64,32 @@ def paint_of(p):
     q.n = len(stops)
     for i, (o, c) in enumerate(stops):
         q.off[i], q.col[i] = o, argb(c)
+    import svgfront
+    spread, focal, fr, ry, rot = svgfront.paint_ext(p)
+    q.spread = SPREAD[spread]
     if p[0] == "linear":
         q.kind = LINEAR
         (q.x0, q.y0), (q.x1, q.y1) = p[1], p[2]
     else:
         q.kind = RADIAL
         (q.x0, q.y0), q.x1 = p[1], p[2]
+        if focal is not None:
+            q.focal, (q.fx, q.fy), q.fr = 1, focal, fr
+        if ry is not None:
+            q.ry, q.rot = ry, rot
+    return q
+
+
+def group_of(g):
+    """svgfront / decoded group -> Group (its box: the file's, or computed as the encoder does)"""
+    import svgfront
+    b = g.get("bbox") or svgfront.group_box(g) or (0.0, 0.0, 0.0, 0.0)
+    q = Group()
+    q.x0, q.y0, q.x1, q.y1 = b
+    q.opacity, q.blur = g["opacity"], g["blur"]
+    q.nshadow = len(g["shadows"][:4])
+    for i, (dx, dy, sg, c) in enumerate(g["shadows"][:4]):
+        q.shadow[i].dx, q.shadow[i].dy, q.shadow[i].sigma, q.shadow[i].color = dx, dy, sg, argb(c)
     return q
 
 
@@ -117,13 +151,25 @@ class Lib:
         L.mcuvg_usage.argtypes = [C.c_void_p, C.POINTER(C.c_uint32), C.POINTER(C.c_uint32)]
         L.mcuvg_draw.argtypes = [C.c_void_p, C.c_char_p, C.c_uint32, C.c_void_p, C.c_uint32]
         L.mcuvg_fit.argtypes = [C.c_void_p, C.c_char_p, C.c_uint32] + [C.c_float] * 5
-        self.ctx = C.create_string_buffer(1024)
+        self.v2 = hasattr(L, "mcuvg_group_begin")       # built with version 2 (not with -DMCUVG_V2=0)
+        if self.v2:
+            L.mcuvg_dash.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int, C.c_float]
+            L.mcuvg_layers.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
+            for f in ("mcuvg_shadow_begin", "mcuvg_group_begin"):
+                getattr(L, f).argtypes = [C.c_void_p, C.POINTER(Group)]
+            for f in ("mcuvg_shadow_end", "mcuvg_group_end"):
+                getattr(L, f).argtypes = [C.c_void_p]
+            L.mcuvg_clip_path.argtypes = [C.c_void_p, C.c_int]
+        self.ctx = C.create_string_buffer(16384)          # sizeof(mcuvg_ctx) with version 2's frames
+        self.layers = C.create_string_buffer(8 << 20)
 
     def context(self, px, w, h, stride, fmt, points=8192):
         n = self.L.mcuvg_mem(w, points, 3 * points)
         self.mem = C.create_string_buffer(n)
         rc = self.L.mcuvg_init(self.ctx, px, w, h, stride, fmt, self.mem, n)
         assert rc == 0, rc
+        if self.v2:
+            self.L.mcuvg_layers(self.ctx, self.layers, len(self.layers))
         return self.ctx
 
     def path(self, segs):
@@ -189,13 +235,39 @@ class Lib:
         self.context(buf, w, h, w * bpp, fmt)
         m = Mat(k, 0, 0, k, 0, 0)
         self.L.mcuvg_set(self.ctx, C.byref(m))
-        for s in doc.shapes:
+        self.items(doc.shapes)
+        return buf.raw, w, h
+
+    def items(self, items):
+        """a tree of shapes and version 2 groups, as the C decoder draws it: a group with shadows twice"""
+        L, c = self.L, self.ctx
+        for s in items:
+            if "group" in s:
+                g = group_of(s)
+                if s["shadows"]:
+                    assert L.mcuvg_shadow_begin(c, C.byref(g)) == 0, "shadow_begin"
+                    self.clip(s)
+                    self.items(s["items"])
+                    assert L.mcuvg_shadow_end(c) == 0, "shadow_end"
+                assert L.mcuvg_group_begin(c, C.byref(g)) == 0, "group_begin"
+                self.clip(s)
+                self.items(s["items"])
+                assert L.mcuvg_group_end(c) == 0, "group_end"
+                continue
             self.path(s["segs"])
             if s["fill"] is not None:
-                rc = self.L.mcuvg_fill(self.ctx, C.byref(paint_of(s["fill"])), EVENODD if s["rule"] == "evenodd" else NONZERO)
+                rc = L.mcuvg_fill(c, C.byref(paint_of(s["fill"])), EVENODD if s["rule"] == "evenodd" else NONZERO)
                 assert rc == 0, f"fill: {rc}"
             if s["stroke"] is not None:
-                rc = self.L.mcuvg_stroke(self.ctx, C.byref(paint_of(s["stroke"])), s["width"], CAPS.get(s["cap"], 0),
-                                         JOINS.get(s["join"], 0), s["miter"])
+                if s.get("dash"):
+                    v, off = s["dash"]
+                    L.mcuvg_dash(c, (C.c_float * len(v))(*v), len(v), off)
+                rc = L.mcuvg_stroke(c, C.byref(paint_of(s["stroke"])), s["width"], CAPS.get(s["cap"], 0),
+                                    JOINS.get(s["join"], 0), s["miter"])
+                L.mcuvg_dash(c, None, 0, 0.0)
                 assert rc == 0, f"stroke: {rc}"
-        return buf.raw, w, h
+
+    def clip(self, g):
+        if g["clip"] is not None:
+            self.path(g["clip"]["segs"])
+            assert self.L.mcuvg_clip_path(self.ctx, EVENODD if g["clip"]["rule"] == "evenodd" else NONZERO) == 0, "clip"

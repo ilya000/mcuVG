@@ -13,12 +13,17 @@
 
 #define MCUVG_MAGIC0 'm'
 #define MCUVG_MAGIC1 'V'
-#define MCUVG_VERSION 1u   /* the newest format version this decoder reads (the header's third byte); it reads every older one */
+#if MCUVG_V2
+#define MCUVG_VERSION 2u   /* the newest format version this decoder reads (the header's third byte); it reads every older one */
+#else
+#define MCUVG_VERSION 1u   /* built without version 2 (MCUVG_V2 0): version 1 pictures only */
+#endif
 
 typedef struct {
     uint32_t w, h;          /* the design box, units */
     uint32_t ncol;          /* colours in the table */
     uint8_t grid;           /* F: coordinates are in 1 / 2^F units */
+    uint8_t ver;            /* the format version */
     uint8_t alpha;          /* the table carries alpha */
     uint32_t col_off;       /* where the table starts */
     uint32_t body_off;      /* where the shapes start */
@@ -28,7 +33,8 @@ typedef struct {
 int mcuvg_head(const void *data, uint32_t len, mcuvg_info *o);
 
 /* draw the picture in design units through the context's matrix.  recolor: NULL, or ncol colours 0xAARRGGBB used
-   instead of the picture's own (a theme, a tint; index i replaces colour i) */
+   instead of the picture's own (a theme, a tint; index i replaces colour i).  A version 2 picture's groups need the
+   layers' memory (mcuvg_layers); without it they return MCUVG_E_FULL */
 int mcuvg_draw(mcuvg_ctx *c, const void *data, uint32_t len, const uint32_t *recolor, uint32_t nrecolor);
 
 /* draw it into the device box (x, y, w, h), aspect kept, centred, turned by deg about the box's centre */
