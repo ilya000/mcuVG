@@ -10,7 +10,7 @@ the busiest path's points and edges, and the block size mcuvg_mem(width, points,
   --quality  100 (default): a coordinate grid of 0.25 px at --px, invisible; lower = coarser grid and simpler outlines,
              smaller files (50: 0.5 px, about 8 % smaller on icons; 25: 1 px, about 16 % smaller, edges start to move)
   --b64   print the picture as a text string "mcuvg:<base64>" (SPEC.md section 5)
-  --lua   print it as a Lua line: cube.vector("mcuvg:...")
+  --lua   print it as a Lua line: mcuvg.draw("mcuvg:...")
   --png   also write FILE.png drawn at --px by the C rasteriser (the device's code), to look at
 """
 import argparse
@@ -74,7 +74,7 @@ def main():
             print(f"  dropped {what}: {why}")
         if a.b64 or a.lua:
             s = "mcuvg:" + base64.b64encode(b).decode()
-            print(f'  cube.vector("{s}")' if a.lua else f"  {s}")
+            print(f'  mcuvg.draw("{s}")' if a.lua else f"  {s}")
     sys.exit(1 if bad else 0)
 
 

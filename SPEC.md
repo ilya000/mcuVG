@@ -97,7 +97,7 @@ An mcuVG picture is often carried inside source code, JSON (MCP tool calls) or L
 prefix `mcuvg:`:
 
 ```lua
-cube.vector("mcuvg:bVYSgAKAAgEAAAABAAletWqrD/NI8SB48KD4pvBrZoFAWnhmb/im9+p4+B/wA/CA9//LeMCcpbSlPMBUy3jwgPCAAA==")
+mcuvg.draw("mcuvg:bVYSgAKAAgEAAAABAAletWqrD/NI8SB48KD4pvBrZoFAWnhmb/im9+p4+B/wA/CA9//LeMCcpbSlPMBUy3jwgPCAAA==")
 ```
 
 As a URI: `data:image/x-mcuvg;base64,…`. File extension: `.mcuvg`.

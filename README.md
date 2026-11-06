@@ -105,7 +105,7 @@ void show_icon(const uint8_t *pic, uint32_t len)  /* pic may live in flash */
 A picture travels inside code as base64 with the prefix `mcuvg:`:
 
 ```lua
-cube.vector("mcuvg:bVYSgAKAAgEAAAABAAletWqrD/NI8SB48KD4pvBrZoFAWnhmb/im9+p4+B/wA/CA9//LeMCcpbSlPMBUy3jwgPCAAA==")
+mcuvg.draw("mcuvg:bVYSgAKAAgEAAAABAAletWqrD/NI8SB48KD4pvBrZoFAWnhmb/im9+p4+B/wA/CA9//LeMCcpbSlPMBUy3jwgPCAAA==")
 ```
 
 ## The format

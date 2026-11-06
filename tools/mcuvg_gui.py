@@ -111,7 +111,7 @@ class App:
             lines.append(line)
             for what, why in doc.dropped:
                 lines.append(f"    dropped {what}: {why}")
-            lines.append(f'    cube.vector("mcuvg:{base64.b64encode(b).decode()}")')
+            lines.append(f'    mcuvg.draw("mcuvg:{base64.b64encode(b).decode()}")')
         if total_svg:
             lines += ["", f"all: {total_svg} B of SVG -> {total_out} B of mcuVG ({100 * total_out / total_svg:.0f} %)"]
         self.show(lines)
