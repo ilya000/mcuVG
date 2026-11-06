@@ -51,6 +51,9 @@ class App:
                   command=lambda v: self.quality.set(int(float(v)))).pack(side="left", padx=4)
         ttk.Label(opts, textvariable=self.quality, width=4).pack(side="left")
         ttk.Label(opts, text="%").pack(side="left")
+        self.v1 = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Version 1 only (a device without clips, shadows, blur)",
+                        variable=self.v1).pack(side="left", padx=(12, 0))
         ttk.Button(opts, text="Convert", command=self.convert).pack(side="right")
         self.text = tk.Text(root, width=110, height=28, wrap="none", font=("Courier", 11))
         self.text.pack(fill="both", expand=True, padx=8, pady=8)
@@ -90,7 +93,7 @@ class App:
         for f in self.files:
             try:
                 doc = svgfront.load(f)
-                b = mcuvg.encode(doc, px, quality=q)
+                b = mcuvg.encode(doc, px, quality=q, maxver=1 if self.v1.get() else mcuvg.VERSION)
             except Exception as e:
                 lines.append(f"{os.path.basename(f)}: not converted: {e}")
                 continue
@@ -100,7 +103,7 @@ class App:
                 o.write(b)
             total_svg += os.path.getsize(f)
             total_out += len(b)
-            line = f"{os.path.basename(f)}: {os.path.getsize(f)} B -> {len(b)} B"
+            line = f"{os.path.basename(f)}: {os.path.getsize(f)} B -> {len(b)} B, version {b[2]}"
             if self.lib is not None:
                 size = int(round(px))
                 k = size / max(doc.vb[2], doc.vb[3])
@@ -108,7 +111,11 @@ class App:
                 _, rc = self.lib.draw_mcuvg(b, w, h, k)
                 pts, edges = self.lib.usage()
                 line += f", device memory at {size} px: {self.lib.block_size(w, pts, edges)} B"
+                if b[2] >= 2:
+                    line += f" + layers {self.lib.layers_used()} B"
             lines.append(line)
+            for what, how in doc.converted:
+                lines.append(f"    converted {what}: {how}")
             for what, why in doc.dropped:
                 lines.append(f"    dropped {what}: {why}")
             lines.append(f'    mcuvg.draw("mcuvg:{base64.b64encode(b).decode()}")')
