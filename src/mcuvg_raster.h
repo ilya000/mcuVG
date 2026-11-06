@@ -123,7 +123,7 @@ typedef struct {
         const uint8_t *mask; int mx0, my0, mw, mh;
         mcuvg_mat m;
         size_t lused;
-        uint8_t *layer; int lx, ly, lw, lh;   /* its layer (first-target pixels), NULL: drawn straight */
+        uint8_t *layer; int lx, ly, lw, lh, lst;   /* its layer (first-target pixels; lst bytes a row), NULL: none */
         int pass;                      /* 1 the shadow pass, 2 the group */
         mcuvg_group g;
     } fr[MCUVG_DEPTH];

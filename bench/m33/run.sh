@@ -33,7 +33,7 @@ pics = [v for k, v in s.items() if k.startswith("pic_")]
 lo = min(a for a, z in pics); hi = max(a + z for a, z in pics)
 top = s["__stack_top"][0]
 m = s["vg_mark"][0]
-print(f"mark={m:#x}," + ",".join([r("px", "s_px"), r("mem", "s_mem"), r("ctx", "s_c"), f"r=stack:{top - 0x10000:#x}:{top:#x}", f"r=pics:{lo:#x}:{hi:#x}"]))')
+print(f"mark={m:#x}," + ",".join([r("px", "s_px"), r("mem", "s_mem"), r("ctx", "s_c"), f"r=stack:{top - 0x10000:#x}:{top:#x}", f"r=pics:{lo:#x}:{hi:#x}"] + ([r("lay", "s_layers")] if "s_layers" in s else [])))')
     qemu-system-arm -M mps2-an505 -cpu cortex-m33 -nographic -monitor none -serial none \
         -semihosting-config enable=on,target=native -d plugin -plugin "$D/out/libmemcost.dylib,$R" \
         -kernel "$D/out/vg_cost.elf" > "$D/out/vg_cost.txt" 2>&1

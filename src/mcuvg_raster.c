@@ -462,6 +462,9 @@ struct pnt {
 static int paint_setup(mcuvg_ctx *c, const mcuvg_paint *p, struct pnt *q)
 {
     q->kind = p->kind;
+#if MCUVG_V2
+    q->ext = 0;                                    /* a flat paint returns below, before the gradient's fields */
+#endif
     if (p->kind == MCUVG_FLAT) { q->flat = premul(p->color); return 0; }
     const mcuvg_mat *m = &c->m;
     float det = m->a * m->d - m->b * m->c;
@@ -568,87 +571,118 @@ static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int 
 static void out_run_mask(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv);
 #endif
 
-static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
-{
-#if MCUVG_V2
-    /* a clip or a gradient of version 2: their own path, so version 1's loop below stays exactly as fast */
-    if (q->ext || c->mask) { out_run_mask(c, q, lut, x0, x1, y, cv); return; }
-#endif
-    int n = x1 - x0;
-    const int lin = q->kind == MCUVG_LINEAR;
-    const float ga = q->ga, gb = q->gb, gc = q->gc;
-    const float ua = q->ua, ub = q->ub, uc = q->uc, ud = q->ud, ue = q->ue, uf = q->uf;
+/* the run's pixels by target: one function each, so that each loop gets the registers to itself (one function with
+   all four let a change in one spill another: the RGB565 gradient loop lost 20 % to a new RGBA fast path, 06.11) */
+#define RUN_LOCALS \
+    const int lin = q->kind == MCUVG_LINEAR; \
+    const float ga = q->ga, gb = q->gb, gc = q->gc; \
+    const float ua = q->ua, ub = q->ub, uc = q->uc, ud = q->ud, ue = q->ue, uf = q->uf; \
+    uint8_t *rowp = (uint8_t *)c->px + (size_t)y * (size_t)c->stride; \
+    uint32_t f = q->kind == MCUVG_FLAT ? (cv == 256u ? q->flat : scale_px(q->flat, cv)) : 0u; \
+    int flat = q->kind == MCUVG_FLAT; \
+    float fy = (float)y + 0.5f; \
+    (void)lin; (void)ga; (void)gb; (void)gc; (void)ua; (void)ub; (void)uc; (void)ud; (void)ue; (void)uf; (void)rowp; (void)fy;
 #define PAINT(X) (lin ? lut_at(lut, ga * (X) + gb * fy + gc) \
                       : lut_at(lut, mcuvg_sqrt((ua * (X) + uc * fy + ue) * (ua * (X) + uc * fy + ue) + \
                                                (ub * (X) + ud * fy + uf) * (ub * (X) + ud * fy + uf))))
-    uint8_t *rowp = (uint8_t *)c->px + (size_t)y * (size_t)c->stride;
-    uint32_t f = q->kind == MCUVG_FLAT ? (cv == 256u ? q->flat : scale_px(q->flat, cv)) : 0u;
-    int flat = q->kind == MCUVG_FLAT;
-    float fy = (float)y + 0.5f;
+
+static __attribute__((noinline)) void run565(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int n, int y, uint32_t cv)
+{
+    RUN_LOCALS
+    uint16_t *d = (uint16_t *)rowp + x0;
+    int sw = c->fmt == MCUVG_RGB565_SWAP;
+    if (flat && (f >> 24) == 255u) {                 /* opaque: the colour once, then stores only */
+        uint32_t o = ARGB565(f);
+        uint16_t v = (uint16_t)(sw ? ((o & 255u) << 8) | (o >> 8) : o);
+        for (int i = 0; i < n; i++) d[i] = v;
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        uint32_t s = flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv), sa = s >> 24, k = 255u - sa;
+        if (!sa) continue;
+        if (sa == 255u) {
+            uint32_t o = ARGB565(s);
+            d[i] = (uint16_t)(sw ? ((o & 255u) << 8) | (o >> 8) : o);
+            continue;
+        }
+        uint32_t v = d[i];
+        if (sw) v = ((v & 255u) << 8) | (v >> 8);
+        uint32_t r = (v >> 11) & 31u, g = (v >> 5) & 63u, b = v & 31u;
+        r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2);
+        r = ((s >> 16) & 255u) + (r * k + 127u) / 255u;
+        g = ((s >> 8) & 255u) + (g * k + 127u) / 255u;
+        b = (s & 255u) + (b * k + 127u) / 255u;
+        v = rgb565(r, g, b);
+        d[i] = (uint16_t)(sw ? ((v & 255u) << 8) | (v >> 8) : v);
+    }
+    return;
+}
+
+static __attribute__((noinline)) void run_rgba(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int n, int y, uint32_t cv)
+{
+    RUN_LOCALS
+    uint8_t *d = rowp + (size_t)x0 * 4u;
+    if (flat && (f >> 24) == 255u && !((uintptr_t)d & 3u)) {   /* opaque: one word a pixel, no blending */
+        uint32_t v = 0xFF000000u | (f & 255u) << 16 | (f & 0xFF00u) | (f >> 16 & 255u);   /* bytes r, g, b, a */
+        uint32_t *w4 = (uint32_t *)(void *)d;
+        for (int i = 0; i < n; i++) w4[i] = v;
+        return;
+    }
+    for (int i = 0; i < n; i++, d += 4) {
+        uint32_t s = flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv), sa = s >> 24, k = 255u - sa;
+        if (sa == 255u) {
+            d[0] = (uint8_t)(s >> 16); d[1] = (uint8_t)(s >> 8); d[2] = (uint8_t)s; d[3] = 255u;
+            continue;
+        }
+        d[0] = (uint8_t)(((s >> 16) & 255u) + (d[0] * k + 127u) / 255u);
+        d[1] = (uint8_t)(((s >> 8) & 255u) + (d[1] * k + 127u) / 255u);
+        d[2] = (uint8_t)((s & 255u) + (d[2] * k + 127u) / 255u);
+        d[3] = (uint8_t)(sa + (d[3] * k + 127u) / 255u);
+    }
+    return;
+}
+
+static __attribute__((noinline)) void run_a8(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int n, int y, uint32_t cv)
+{
+    RUN_LOCALS
+    uint8_t *d = rowp + x0;
+    if (flat && (f >> 24) == 255u) {                 /* opaque: a store, no blending */
+        for (int i = 0; i < n; i++) d[i] = 255u;
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        uint32_t sa = (flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv)) >> 24;
+        d[i] = (uint8_t)(sa + (d[i] * (255u - sa) + 127u) / 255u);
+    }
+    return;
+}
+
+static __attribute__((noinline)) void run_span(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int n, int y, uint32_t cv)
+{
+    RUN_LOCALS
+    if (!c->span) return;
+    while (n > 0) {                                  /* through the span buffer, w pixels at most at a time */
+        int k = n < c->w ? n : c->w;
+        for (int i = 0; i < k; i++) c->pix[i] = flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv);
+        c->span(c->user, x0, y, k, c->pix);
+        x0 += k;
+        n -= k;
+    }
+    return;
+}
+
+static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
+{
+#if MCUVG_V2
+    /* a clip or a gradient of version 2: their own path, so version 1's loops stay exactly as fast */
+    if (q->ext || c->mask) { out_run_mask(c, q, lut, x0, x1, y, cv); return; }
+#endif
     switch (c->fmt) {
     case MCUVG_RGB565:
-    case MCUVG_RGB565_SWAP: {
-        uint16_t *d = (uint16_t *)rowp + x0;
-        int sw = c->fmt == MCUVG_RGB565_SWAP;
-        if (flat && (f >> 24) == 255u) {                 /* opaque: the colour once, then stores only */
-            uint32_t o = ARGB565(f);
-            uint16_t v = (uint16_t)(sw ? ((o & 255u) << 8) | (o >> 8) : o);
-            for (int i = 0; i < n; i++) d[i] = v;
-            return;
-        }
-        for (int i = 0; i < n; i++) {
-            uint32_t s = flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv), sa = s >> 24, k = 255u - sa;
-            if (!sa) continue;
-            if (sa == 255u) {
-                uint32_t o = ARGB565(s);
-                d[i] = (uint16_t)(sw ? ((o & 255u) << 8) | (o >> 8) : o);
-                continue;
-            }
-            uint32_t v = d[i];
-            if (sw) v = ((v & 255u) << 8) | (v >> 8);
-            uint32_t r = (v >> 11) & 31u, g = (v >> 5) & 63u, b = v & 31u;
-            r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2);
-            r = ((s >> 16) & 255u) + (r * k + 127u) / 255u;
-            g = ((s >> 8) & 255u) + (g * k + 127u) / 255u;
-            b = (s & 255u) + (b * k + 127u) / 255u;
-            v = rgb565(r, g, b);
-            d[i] = (uint16_t)(sw ? ((v & 255u) << 8) | (v >> 8) : v);
-        }
-        return;
-    }
-    case MCUVG_RGBA8888: {
-        uint8_t *d = rowp + (size_t)x0 * 4u;
-        for (int i = 0; i < n; i++, d += 4) {
-            uint32_t s = flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv), sa = s >> 24, k = 255u - sa;
-            if (sa == 255u) {
-                d[0] = (uint8_t)(s >> 16); d[1] = (uint8_t)(s >> 8); d[2] = (uint8_t)s; d[3] = 255u;
-                continue;
-            }
-            d[0] = (uint8_t)(((s >> 16) & 255u) + (d[0] * k + 127u) / 255u);
-            d[1] = (uint8_t)(((s >> 8) & 255u) + (d[1] * k + 127u) / 255u);
-            d[2] = (uint8_t)((s & 255u) + (d[2] * k + 127u) / 255u);
-            d[3] = (uint8_t)(sa + (d[3] * k + 127u) / 255u);
-        }
-        return;
-    }
-    case MCUVG_A8: {
-        uint8_t *d = rowp + x0;
-        for (int i = 0; i < n; i++) {
-            uint32_t sa = (flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv)) >> 24;
-            d[i] = (uint8_t)(sa + (d[i] * (255u - sa) + 127u) / 255u);
-        }
-        return;
-    }
-    default:
-        if (!c->span) return;
-        while (n > 0) {                                  /* through the span buffer, w pixels at most at a time */
-            int k = n < c->w ? n : c->w;
-            for (int i = 0; i < k; i++) c->pix[i] = flat ? f : scale_px(PAINT((float)(x0 + i) + 0.5f), cv);
-            c->span(c->user, x0, y, k, c->pix);
-            x0 += k;
-            n -= k;
-        }
-        return;
+    case MCUVG_RGB565_SWAP: run565(c, q, lut, x0, x1 - x0, y, cv); return;
+    case MCUVG_RGBA8888: run_rgba(c, q, lut, x0, x1 - x0, y, cv); return;
+    case MCUVG_A8: run_a8(c, q, lut, x0, x1 - x0, y, cv); return;
+    default: run_span(c, q, lut, x0, x1 - x0, y, cv); return;
     }
 }
 
@@ -1203,25 +1237,56 @@ static void blend_row(mcuvg_ctx *c, int x0, int y, int n, const uint32_t *s)
     }
 }
 
-/* one pixel of paint q at (X, fy): premultiplied */
-static uint32_t paint_px(const struct pnt *q, const uint32_t *lut, float X, float fy)
+/* a gradient run under a clip or of version 2 (spread, focal point): its coefficients held in registers (a load of the
+   paint's fields a pixel would cost ~10 cycles each here), the coverage times the mask's row when mrow is given */
+static __attribute__((noinline)) void run_grad(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y,
+                                               uint32_t cv, const uint8_t *mrow)
 {
-    if (q->kind == MCUVG_FLAT) return q->flat;
-    if (q->kind == MCUVG_LINEAR) return lut_sp(lut, q->ga * X + q->gb * fy + q->gc, q->spread);
-    float u = q->ua * X + q->uc * fy + q->ue, v = q->ub * X + q->ud * fy + q->uf;
-    return lut_sp(lut, q->focal ? focal_t(u, v, q->fx, q->fy, q->fr, q->fa, q->dr) : mcuvg_sqrt(u * u + v * v), q->spread);
-}
-
-/* out_run under a clip, or with a gradient of version 2: pixel by pixel (the coverage times the mask), then over the
-   target */
-static void out_run_mask(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
-{
-    float fy = (float)y + 0.5f;
+    const int lin = q->kind == MCUVG_LINEAR, spread = q->spread, focal = q->focal;
+    const float ga = q->ga, gb = q->gb, gc = q->gc, ua = q->ua, ub = q->ub, uc = q->uc, ud = q->ud, ue = q->ue, uf = q->uf;
+    const float ffx = q->fx, ffy = q->fy, ffr = q->fr, ffa = q->fa, fdr = q->dr, fy = (float)y + 0.5f;
     while (x0 < x1) {
         int n = x1 - x0 < c->w ? x1 - x0 : c->w;
         for (int i = 0; i < n; i++) {
-            uint32_t k = c->mask ? (cv * mask_at(c, x0 + i + c->ox, y + c->oy) + 127u) / 255u : cv;
-            c->pix[i] = k ? scale_px(paint_px(q, lut, (float)(x0 + i) + 0.5f, fy), k) : 0u;
+            uint32_t k = cv;
+            if (mrow) {
+                uint32_t m = mrow[x0 + i];
+                k = m ? (cv * m + 127u) / 255u : 0u;
+                if (!k) { c->pix[i] = 0; continue; }
+            }
+            float X = (float)(x0 + i) + 0.5f, t;
+            if (lin) t = ga * X + gb * fy + gc;
+            else {
+                float u = ua * X + uc * fy + ue, v = ub * X + ud * fy + uf;
+                t = focal ? focal_t(u, v, ffx, ffy, ffr, ffa, fdr) : mcuvg_sqrt(u * u + v * v);
+            }
+            uint32_t p = lut_sp(lut, t, spread);
+            c->pix[i] = k == 256u ? p : scale_px(p, k);
+        }
+        blend_row(c, x0, y, n, c->pix);
+        x0 += n;
+    }
+}
+
+/* out_run under a clip, or with a gradient of version 2: a flat paint once, a gradient by run_grad; the coverage times
+   the mask's row (looked up once a run), then over the target */
+static void out_run_mask(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
+{
+    const uint8_t *mrow = 0;
+    if (c->mask) {
+        int Y = y + c->oy, mx = c->mx0 - c->ox;                  /* the mask's first column, in the target's pixels */
+        if (Y < c->my0 || Y >= c->my0 + c->mh) return;           /* the row lies outside the clip */
+        if (x0 < mx) x0 = mx;
+        if (x1 > mx + c->mw) x1 = mx + c->mw;
+        mrow = c->mask + (size_t)(Y - c->my0) * (size_t)c->mw - mx;
+    }
+    if (q->kind != MCUVG_FLAT) { run_grad(c, q, lut, x0, x1, y, cv, mrow); return; }
+    const uint32_t flat = q->flat;
+    while (x0 < x1) {
+        int n = x1 - x0 < c->w ? x1 - x0 : c->w;
+        for (int i = 0; i < n; i++) {
+            uint32_t m = mrow[x0 + i], k = m ? (cv * m + 127u) / 255u : 0u;
+            c->pix[i] = k ? scale_px(flat, k) : 0u;
         }
         blend_row(c, x0, y, n, c->pix);
         x0 += n;
@@ -1261,7 +1326,7 @@ static struct mcuvg_frame *push(mcuvg_ctx *c, int pass, const mcuvg_group *g)
     f->mask = c->mask; f->mx0 = c->mx0; f->my0 = c->my0; f->mw = c->mw; f->mh = c->mh;
     f->m = c->m;
     f->lused = c->lused;
-    f->layer = 0; f->lx = f->ly = f->lw = f->lh = 0;
+    f->layer = 0; f->lx = f->ly = f->lw = f->lh = f->lst = 0;
     f->pass = pass;
     if (g) f->g = *g;
     return f;
@@ -1301,30 +1366,85 @@ static void box_radii(float sigma, int r[3])
     for (int i = 0; i < 3; i++) r[i] = ((i < m ? wl : wl + 2) - 1) / 2;
 }
 
-/* one line of n values at step bytes, a box of radius r; outside is 0.  tmp: n bytes */
-static void blur_line(uint8_t *p, int n, int step, int r, uint8_t *tmp)
+/* One box pass over n words of four 8-bit lanes each: dst[x] = the mean of src[x - r .. x + r] (0 outside), lane by
+   lane.  Lanes 0 and 2 and lanes 1 and 3 are summed together, 16 bits each (r < 128: 255 (2r + 1) fits).  On a core
+   whose data memory is uncached a load or a store costs ~10 cycles, so the four lanes of a word are the point: an RGBA
+   pixel's channels, or four rows or columns of an 8-bit layer side by side. */
+static void box_lanes(const uint32_t *src, uint32_t *dst, int n, int r)
 {
-    for (int i = 0; i < n; i++) tmp[i] = p[i * step];
-    uint32_t w = 2u * (uint32_t)r + 1u, inv = (65536u + w / 2u) / w, sum = 0;
-    for (int i = 0; i <= r && i < n; i++) sum += tmp[i];
+    uint32_t w = 2u * (uint32_t)r + 1u, inv = (65536u + w / 2u) / w, ev = 0, od = 0;
+    for (int i = 0; i <= r && i < n; i++) { uint32_t v = src[i]; ev += v & 0x00FF00FFu; od += (v >> 8) & 0x00FF00FFu; }
     for (int x = 0; x < n; x++) {
-        p[x * step] = (uint8_t)((sum * inv + 32768u) >> 16);
-        if (x + r + 1 < n) sum += tmp[x + r + 1];
-        if (x - r >= 0) sum -= tmp[x - r];
+        dst[x] = (((ev & 0xFFFFu) * inv + 32768u) >> 16) | ((((od & 0xFFFFu) * inv + 32768u) >> 16) << 8) |
+                 ((((ev >> 16) * inv + 32768u) >> 16) << 16) | ((((od >> 16) * inv + 32768u) >> 16) << 24);
+        if (x + r + 1 < n) { uint32_t v = src[x + r + 1]; ev += v & 0x00FF00FFu; od += (v >> 8) & 0x00FF00FFu; }
+        if (x - r >= 0) { uint32_t v = src[x - r]; ev -= v & 0x00FF00FFu; od -= (v >> 8) & 0x00FF00FFu; }
     }
 }
 
-static void blur(uint8_t *buf, int w, int h, int bpp, float sigma, uint8_t *tmp)
+/* three box passes over n words: a -> b -> a -> b; the result in b */
+static void box3(uint32_t *a, uint32_t *b, int n, const int r[3])
+{
+    box_lanes(a, b, n, r[0]);
+    box_lanes(b, a, n, r[1]);
+    box_lanes(a, b, n, r[2]);
+}
+
+/* four bytes of four words as four words of four bytes (a 4 x 4 transpose; its own inverse) */
+static inline __attribute__((always_inline)) void tr4(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
+{
+    uint32_t t0 = (*a & 0x00FF00FFu) | ((*b & 0x00FF00FFu) << 8), t1 = ((*a >> 8) & 0x00FF00FFu) | (*b & 0xFF00FF00u);
+    uint32_t t2 = (*c & 0x00FF00FFu) | ((*d & 0x00FF00FFu) << 8), t3 = ((*c >> 8) & 0x00FF00FFu) | (*d & 0xFF00FF00u);
+    *a = (t0 & 0xFFFFu) | (t2 << 16); *b = (t1 & 0xFFFFu) | (t3 << 16);
+    *c = (t0 >> 16) | (t2 & 0xFFFF0000u); *d = (t1 >> 16) | (t3 & 0xFFFF0000u);
+}
+
+/* a Gaussian blur of sigma pixels, as three box blurs each way (the cost does not grow with the radius): an 8-bit
+   buffer (bpp 1) or an RGBA one (bpp 4), w x h, `stride` bytes a row (a multiple of 4), 4-aligned; t0, t1: scratch of
+   max(w, h) + 4 words each.  Outside the buffer is 0 (transparent), as SVG's blur sees it */
+static void blur(uint8_t *buf, int w, int h, int stride, int bpp, float sigma, uint32_t *t0, uint32_t *t1)
 {
     if (!(sigma > 0.2f)) return;
+    if (sigma > 120.0f) sigma = 120.0f;
     int r[3];
     box_radii(sigma, r);
-    for (int k = 0; k < 3; k++) {
-        if (!r[k]) continue;
-        for (int y = 0; y < h; y++)
-            for (int ch = 0; ch < bpp; ch++) blur_line(buf + (size_t)y * (size_t)(w * bpp) + ch, w, bpp, r[k], tmp);
-        for (int x = 0; x < w; x++)
-            for (int ch = 0; ch < bpp; ch++) blur_line(buf + (size_t)x * (size_t)bpp + ch, h, w * bpp, r[k], tmp);
+    if (bpp == 4) {
+        for (int y = 0; y < h; y++) {                        /* rows: a pixel is a word of four channels */
+            uint32_t *row = (uint32_t *)(void *)(buf + (size_t)y * (size_t)stride);
+            box_lanes(row, t0, w, r[0]);
+            box_lanes(t0, t1, w, r[1]);
+            box_lanes(t1, row, w, r[2]);
+        }
+        for (int x = 0; x < w; x++) {                        /* columns: gathered, blurred, put back */
+            uint32_t *col = (uint32_t *)(void *)(buf + (size_t)x * 4u);
+            int sw = stride / 4;
+            for (int y = 0; y < h; y++) t0[y] = col[y * sw];
+            box3(t0, t1, h, r);
+            for (int y = 0; y < h; y++) col[y * sw] = t1[y];
+        }
+        return;
+    }
+    int sw = stride / 4, nw = (w + 3) / 4;
+    for (int y0 = 0; y0 < h; y0 += 4) {                      /* four rows at once: each column a word of four rows */
+        uint32_t *rw[4];
+        for (int k = 0; k < 4; k++) rw[k] = y0 + k < h ? (uint32_t *)(void *)(buf + (size_t)(y0 + k) * (size_t)stride) : 0;
+        for (int i = 0; i < nw; i++) {
+            uint32_t a = rw[0][i], b = rw[1] ? rw[1][i] : 0, c = rw[2] ? rw[2][i] : 0, d = rw[3] ? rw[3][i] : 0;
+            tr4(&a, &b, &c, &d);
+            t0[4 * i] = a; t0[4 * i + 1] = b; t0[4 * i + 2] = c; t0[4 * i + 3] = d;
+        }
+        box3(t0, t1, w, r);
+        for (int i = 0; i < nw; i++) {
+            uint32_t a = t1[4 * i], b = t1[4 * i + 1], c = t1[4 * i + 2], d = t1[4 * i + 3];
+            tr4(&a, &b, &c, &d);
+            for (int k = 0; k < 4; k++) if (rw[k]) rw[k][i] = k == 0 ? a : k == 1 ? b : k == 2 ? c : d;
+        }
+    }
+    for (int i = 0; i < sw; i++) {                           /* four columns at once: a word of a row */
+        uint32_t *col = (uint32_t *)(void *)buf + i;
+        for (int y = 0; y < h; y++) t0[y] = col[y * sw];
+        box3(t0, t1, h, r);
+        for (int y = 0; y < h; y++) col[y * sw] = t1[y];
     }
 }
 
@@ -1338,10 +1458,12 @@ int mcuvg_shadow_begin(mcuvg_ctx *c, const mcuvg_group *g)
     c->mask = 0;                                    /* the clip in force applies when the shadow is laid, not here */
     struct box b = dev_box(c, g->x0, g->y0, g->x1, g->y1, 0);
     if (b.w <= 0 || b.h <= 0) { draw_nothing(c); return MCUVG_OK; }
-    uint8_t *buf = lalloc(c, (size_t)b.w * (size_t)b.h);
+    int st4 = (b.w + 3) & ~3;                           /* rows a multiple of 4 bytes: the blur reads them by words */
+    uint8_t *buf = lalloc(c, (size_t)st4 * (size_t)b.h);
     if (!buf) { c->depth--; restore(c, f); return MCUVG_E_FULL; }
-    f->layer = buf; f->lx = b.x; f->ly = b.y; f->lw = b.w; f->lh = b.h;
+    f->layer = buf; f->lx = b.x; f->ly = b.y; f->lw = b.w; f->lh = b.h; f->lst = st4;
     retarget(c, buf, &b, MCUVG_A8, 1);              /* the group's alpha: everything it draws, as coverage */
+    c->stride = st4;
     return MCUVG_OK;
 }
 
@@ -1353,6 +1475,7 @@ int mcuvg_shadow_end(mcuvg_ctx *c)
     int rc = MCUVG_OK;
     if (f->layer) {
         float sc = mat_scale(&c->m);
+        int lst = f->lst;
         for (uint32_t s = 0; s < f->g.nshadow && rc == MCUVG_OK; s++) {
             const mcuvg_shadow *sh = &f->g.shadow[s];
             float sig = sh->sigma * sc;
@@ -1369,22 +1492,24 @@ int mcuvg_shadow_end(mcuvg_ctx *c)
             /* blurred over that box grown by the reach once more, so its edges see all the alpha that reaches them */
             int bx0 = sx0 - g, by0 = sy0 - g, bw = sx1 - sx0 + 2 * g, bh = sy1 - sy0 + 2 * g;
             size_t mark = c->lused;
-            uint8_t *a = lalloc(c, (size_t)bw * (size_t)bh), *tmp = lalloc(c, (size_t)(bw > bh ? bw : bh));
-            if (!a || !tmp) { rc = MCUVG_E_FULL; c->lused = mark; break; }
+            int bs = (bw + 3) & ~3, tn = (bw > bh ? bw : bh) + 4;
+            uint8_t *a = lalloc(c, (size_t)bs * (size_t)bh);
+            uint32_t *t0 = (uint32_t *)(void *)lalloc(c, (size_t)tn * 4u), *t1 = (uint32_t *)(void *)lalloc(c, (size_t)tn * 4u);
+            if (!a || !t0 || !t1) { rc = MCUVG_E_FULL; c->lused = mark; break; }
             for (int y = 0; y < f->lh; y++) {               /* the alpha, moved by the offset */
                 int Y = f->ly + oy + y - by0;
                 if (Y < 0 || Y >= bh) continue;
                 for (int x = 0; x < f->lw; x++) {
                     int X = f->lx + ox + x - bx0;
-                    if (X >= 0 && X < bw) a[Y * bw + X] = f->layer[y * f->lw + x];
+                    if (X >= 0 && X < bw) a[Y * bs + X] = f->layer[y * lst + x];
                 }
             }
-            blur(a, bw, bh, 1, sig, tmp);
+            blur(a, bw, bh, bs, 1, sig, t0, t1);
             uint32_t col = premul(sh->color);
             for (int Y = sy0; Y < sy1; Y++) {
                 int n = sx1 - sx0;
                 for (int i = 0; i < n; i++) {
-                    uint32_t v = a[(Y - by0) * bw + (sx0 + i - bx0)];
+                    uint32_t v = a[(Y - by0) * bs + (sx0 + i - bx0)];
                     if (c->mask && v) v = (v * mask_at(c, sx0 + i, Y) + 127u) / 255u;
                     c->pix[i] = v ? scale_px(col, v + (v >> 7)) : 0u;     /* v 0..255 -> 0..256 */
                 }
@@ -1475,8 +1600,9 @@ int mcuvg_group_end(mcuvg_ctx *c)
     restore(c, f);
     if (f->layer) {
         if (f->g.blur > 0) {
-            uint8_t *tmp = lalloc(c, (size_t)(f->lw > f->lh ? f->lw : f->lh));
-            if (tmp) blur(f->layer, f->lw, f->lh, 4, f->g.blur * mat_scale(&c->m), tmp);
+            int tn = (f->lw > f->lh ? f->lw : f->lh) + 4;
+            uint32_t *t0 = (uint32_t *)(void *)lalloc(c, (size_t)tn * 4u), *t1 = (uint32_t *)(void *)lalloc(c, (size_t)tn * 4u);
+            if (t0 && t1) blur(f->layer, f->lw, f->lh, f->lw * 4, 4, f->g.blur * mat_scale(&c->m), t0, t1);
         }
         uint32_t k = (uint32_t)(f->g.opacity * 256.0f + 0.5f);
         if (k > 256u) k = 256u;

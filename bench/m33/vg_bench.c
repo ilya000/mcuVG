@@ -61,6 +61,16 @@ __attribute__((naked)) void systick_handler(void)
 static uint16_t s_px[480 * 480];
 static uint8_t s_mem[160 * 1024] __attribute__((aligned(8)));
 static mcuvg_ctx s_c;
+#if MCUVG_V2
+static uint8_t s_layers[2 * 1024 * 1024] __attribute__((aligned(8)));   /* version 2's layers (a 480 px RGBA one: 0.9 MB) */
+#endif
+static void init(int size)
+{
+    mcuvg_init(&s_c, s_px, size, size, size * 2, MCUVG_RGB565, s_mem, sizeof s_mem);
+#if MCUVG_V2
+    mcuvg_layers(&s_c, s_layers, sizeof s_layers);
+#endif
+}
 static uint32_t s_ipt_x1000;
 
 static uint32_t fnv(const void *p, uint32_t n)
@@ -75,7 +85,7 @@ static uint32_t fnv(const void *p, uint32_t n)
 static uint32_t draw(const struct pic *p, int size, float deg, uint32_t *sum)
 {
     for (int i = 0; i < size * size; i++) s_px[i] = 0;
-    mcuvg_init(&s_c, s_px, size, size, size * 2, MCUVG_RGB565, s_mem, sizeof s_mem);
+    init(size);
     uint32_t a = SYST_CVR;
     int rc;
     if (deg == 0.0f) {
@@ -102,7 +112,7 @@ static void cost_run(void)
         for (int s = 0; s < 4; s++) {
             int size = s < 3 ? sizes[s] : 112;
             for (int k = 0; k < size * size; k++) s_px[k] = 0;
-            mcuvg_init(&s_c, s_px, size, size, size * 2, MCUVG_RGB565, s_mem, sizeof s_mem);
+            init(size);
             MARK = 0xC0DE0000u | (i * 16u + (s < 3 ? (unsigned)s : 8u));
             if (s < 3) {
                 float kk = (float)size / s_pics[i].w;
@@ -130,7 +140,7 @@ int main(void)
             for (int s = 0; s < 2; s++) {
                 uint32_t sum;
                 for (int k = 0; k < psz[s] * psz[s]; k++) s_px[k] = 0;
-                mcuvg_init(&s_c, s_px, psz[s], psz[s], psz[s] * 2, MCUVG_RGB565, s_mem, sizeof s_mem);
+                init(psz[s]);
                 float kk = (float)psz[s] / s_pics[i].w;
                 mcuvg_scale(&s_c, kk, kk);
                 s_on = 1;
