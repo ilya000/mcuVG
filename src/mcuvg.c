@@ -322,7 +322,12 @@ static int group(struct dec *d, mcuvg_ctx *c)
             rc = path(d, c);
             if (!rc) rc = mcuvg_clip_path(c, (fl & 4u) ? MCUVG_EVENODD : MCUVG_NONZERO);
             d->r.i = keep;
-            if (rc) { d->depth--; return rc; }
+            if (rc) {                                /* the pass is open: closed before leaving, so the context is
+                                                        the caller's again (its target, not a layer) */
+                if (pass == 1) (void)mcuvg_shadow_end(c); else (void)mcuvg_group_end(c);
+                d->depth--;
+                return rc;
+            }
         }
         d->r.i = start; d->px = spx; d->py = spy; d->ar = sar; d->ary = sary; d->arot = sarot; d->have_path = shp;
         rc = body(d, c, 1);

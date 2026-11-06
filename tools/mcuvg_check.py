@@ -88,6 +88,20 @@ def main():
         vbad.append("version 2 by a version 1 build")
     if v1.draw_mcuvg(b, 64, 64, 0.25)[1] != 0:
         vbad.append("version 1 REFUSED by a version 1 build")
+    # too little layer memory (a small device): a version 2 picture draws or says MCUVG_E_FULL (-1), never crashes
+    small = []
+    for f in files:
+        b2 = mcuvg.encode(svgfront.load(f), a.px)
+        if b2[2] < 2:
+            continue
+        for lim in (0, 1024, 16384):
+            lib.layers_limit = lim
+            rc = lib.draw_mcuvg(b2, 112, 112, 112 / max(1, svgfront.load(f).vb[2]))[1]
+            if rc not in (0, -1):
+                small.append(f"{os.path.basename(f)} at {lim} B: rc {rc}")
+        lib.layers_limit = None
+    print(f"little layer memory: {'every version 2 picture drawn or refused with E_FULL' if not small else 'WRONG: ' + ', '.join(small)}")
+    vbad += small
     print(f"version byte: {'versions 1 and 2 drawn' if ok else 'version 1 or 2 REFUSED'}, "
           f"{'every newer version and reserved bit refused, a version 1 build refuses version 2' if not vbad else 'WRONG: ' + ', '.join(vbad)}")
     sys.exit(1 if diff or errs != total or vbad or not ok else 0)

@@ -164,6 +164,7 @@ class Lib:
             L.mcuvg_layers_used.restype = C.c_size_t
         self.ctx = C.create_string_buffer(16384)          # sizeof(mcuvg_ctx) with version 2's frames
         self.layers = C.create_string_buffer(8 << 20)
+        self.layers_limit = None                          # bytes of layer memory to give (a small device), None: all
 
     def context(self, px, w, h, stride, fmt, points=8192):
         n = self.L.mcuvg_mem(w, points, 3 * points)
@@ -171,7 +172,8 @@ class Lib:
         rc = self.L.mcuvg_init(self.ctx, px, w, h, stride, fmt, self.mem, n)
         assert rc == 0, rc
         if self.v2:
-            self.L.mcuvg_layers(self.ctx, self.layers, len(self.layers))
+            n = len(self.layers) if self.layers_limit is None else min(self.layers_limit, len(self.layers))
+            self.L.mcuvg_layers(self.ctx, self.layers if n else None, n)
         return self.ctx
 
     def path(self, segs):

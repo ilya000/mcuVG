@@ -1489,8 +1489,14 @@ int mcuvg_shadow_end(mcuvg_ctx *c)
             if (sx1 > c->ox + c->cx1) sx1 = c->ox + c->cx1;
             if (sy1 > c->oy + c->cy1) sy1 = c->oy + c->cy1;
             if (sx0 >= sx1 || sy0 >= sy1) continue;
-            /* blurred over that box grown by the reach once more, so its edges see all the alpha that reaches them */
-            int bx0 = sx0 - g, by0 = sy0 - g, bw = sx1 - sx0 + 2 * g, bh = sy1 - sy0 + 2 * g;
+            /* blurred over the moved alpha grown by the reach, inside the target grown by it: all the alpha that
+               reaches the laid box, and no more (the alpha itself never lies outside the target) */
+            int bx0 = f->lx + ox - g, by0 = f->ly + oy - g, bx1 = f->lx + ox + f->lw + g, by1 = f->ly + oy + f->lh + g;
+            if (bx0 < sx0 - g) bx0 = sx0 - g;
+            if (by0 < sy0 - g) by0 = sy0 - g;
+            if (bx1 > sx1 + g) bx1 = sx1 + g;
+            if (by1 > sy1 + g) by1 = sy1 + g;
+            int bw = bx1 - bx0, bh = by1 - by0;
             size_t mark = c->lused;
             int bs = (bw + 3) & ~3, tn = (bw > bh ? bw : bh) + 4;
             uint8_t *a = lalloc(c, (size_t)bs * (size_t)bh);
