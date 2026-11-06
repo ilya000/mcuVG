@@ -44,6 +44,15 @@ paints, fields); a file that needs none of the additions stays at the version th
 
 A decoder refuses a version newer than its own, as it refuses any other picture it cannot read (section 6).
 
+### 2.2. Version 2 (in development)
+
+Version 2 adds what needs an offscreen layer or more paint: clipping paths, soft edges with shadow and glow (a blur of a
+shape's coverage), exact group opacity, dashed strokes, and gradients in full (elliptical radial, a focal point,
+`reflect` and `repeat`). A layer costs an 8-bit mask of the affected area while it is drawn (about 12.5 KB for a 112 px
+icon, about 225 KB for a 480 px picture), so a decoder for a small device may stay at version 1: it refuses version 2
+pictures cleanly, and an encoder writes version 1 for every picture that uses none of these features (rule 2).
+This section is filled in when version 2 is fixed.
+
 ## 3. Shapes
 
 Shapes follow the header until a kind byte of 0. They are painted in order, each over what is already drawn.
@@ -126,7 +135,15 @@ A conforming decoder:
 
 ## 7. What the format leaves out (by design, for now)
 
-Text, images, masks, clipping, filters (blur, glow), group opacity, patterns, dashes, animation. The converter reports what it dropped. Group opacity is approximated by multiplying the alpha of each shape.
+- **Animation.** A picture is static: one still image, no timeline, no scripting. Motion is the drawing program's
+  (the same picture drawn each frame through another matrix or colour table).
+- **Text and markers.** A converter turns them into ordinary shapes (glyph outlines, copies of the marker at the
+  vertices); the format and the decoder know neither.
+- **Images, masks, patterns.**
+- **Clipping, filters (blur, glow, shadows), exact group opacity, dashes** - version 2 (2.2). In version 1 a
+  group's opacity is approximated by multiplying the alpha of each shape, and a dashed stroke is solid.
+
+A converter reports whatever it drops or simplifies.
 
 ## 8. Open before 1.0
 

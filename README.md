@@ -118,7 +118,69 @@ fill; strokes with butt/round/square caps, miter/round/bevel joins and a miter l
 gradients of up to 8 stops. Coordinates are deltas on a grid the converter picks from the display size: 69 % of them
 fit in one byte. Commands take 3 bits. Half of the arcs in icons repeat the previous radius and do not store it.
 
-Not in the format (the converter reports them): text, images, masks, clipping, filters, group opacity, dashes.
+**Static pictures.** A file is one still picture: there is no animation, timeline or scripting in the format. Motion
+belongs to the program that draws it - the same bytes drawn every frame at another position, size, angle or with other
+colours (`mcuvg_fit`, the matrix, `recolor`).
+
+## What SVG it takes
+
+The converter reads SVG and writes the lowest format version that holds the picture (SPEC.md 2.1). Everything it drops
+or simplifies is reported by name, never drawn wrong in silence (`python3 tools/svgfront.py FILE.svg` lists them).
+
+### Version 1 (the format today)
+
+| SVG | How |
+|---|---|
+| Elements | `path`, `rect` (with `rx`/`ry`), `circle`, `ellipse`, `line`, `polyline`, `polygon`; groups `g`, `a`, nested `svg`, `use` and `symbol` |
+| Path commands | every one: lines, `H`/`V`, quadratic and cubic Béziers (`S`/`T` too), elliptical arcs as in SVG |
+| Transforms | any: `translate`, `scale`, `rotate`, `skewX`/`skewY`, `matrix`, nested. The converter applies them; an arc stays an arc while the transform keeps circles circles, otherwise it becomes cubic curves |
+| Fill | non-zero and even-odd rules |
+| Stroke | width; caps `butt`, `round`, `square`; joins `miter`, `round`, `bevel`; the miter limit |
+| Paint | a colour with alpha (hex, `rgb()`/`rgba()`, `hsl()`/`hsla()`, the 148 CSS colour keywords, `currentColor`; anything else is reported); linear and radial gradients of up to 8 stops (`gradientUnits`, `gradientTransform`, `href` chains); outside the stops the end colours extend (`pad`) |
+| Opacity | `opacity`, `fill-opacity`, `stroke-opacity`; a group's opacity approximately - multiplied into each of its shapes |
+| Styles | presentation attributes, `style=""`, `<style>` with tag and class selectors, inheritance, `display`, `visibility` |
+
+### Turned into ordinary paths by the converter (no format version needed)
+
+| SVG | How |
+|---|---|
+| `text`, `tspan` | the glyph outlines of a TrueType font found by its `font-family` (`tools/ttf.py`: the system's font folders and `MCUVG_FONTS`; `serif`, `sans-serif`, `monospace` map to common fonts); `font-size`, `font-weight`, `font-style`, `text-anchor`, `letter-spacing`, `x`/`y` on a `tspan`. One glyph a character on the baseline: no kerning, ligatures or shaping (labels and titles, not running text in scripts that need shaping). Fonts with CFF outlines (most `.otf`) are reported, not used |
+| `marker-start`, `marker-mid`, `marker-end` | a copy of the marker's content at each vertex of `path`, `line`, `polyline`, `polygon`: `orient` (`auto`, `auto-start-reverse`, an angle), `markerUnits`, `viewBox`, `markerWidth`/`markerHeight`, `refX`/`refY`. The marker's overflow is not clipped |
+
+The device never sees text or markers: they arrive as shapes, at the cost of their bytes.
+
+### Not supported (reported by the converter)
+
+- Images (`image`), `foreignObject`, `switch`.
+- Masks (`mask`), clipping (`clipPath`), filters (blur, glow, shadows), patterns - **version 2** (below) takes
+  clipping, blur, shadows and glow.
+- Dashes (`stroke-dasharray`): drawn as a solid line - **version 2**.
+- Animation of any kind (SMIL, CSS): the format is static (above).
+
+Simplified, and reported:
+
+- a radial gradient on an ellipse (a non-uniform `gradientTransform` or bounding box) is drawn as a circle;
+- `spreadMethod` `reflect` and `repeat` are drawn as `pad`;
+- the focal point (`fx`, `fy`) of a radial gradient is ignored;
+- a group's opacity is multiplied into each shape, so overlapping shapes of one group show through each other;
+- a stroke under a non-uniform transform keeps one width (the transform's mean scale).
+
+### Version 2 (in development)
+
+What designers' SVG (Figma, PlayKit-style icons) needs next:
+
+| Feature | Why |
+|---|---|
+| Clipping (`clipPath`) | in almost every SVG exported from Figma; clipping to a shape (a hexagon, a rounded card) |
+| Soft edge, shadow and glow (`feGaussianBlur`, `feDropShadow` on a shape) | depth and highlights of painted-looking icons; glows in UI designs |
+| Exact group opacity | a translucent group whose shapes overlap |
+| Dashes (`stroke-dasharray`, `stroke-dashoffset`) | the converter could cut a dash into pieces, but in the format it is far smaller |
+| Gradients in full | elliptical radial gradients, the focal point, `reflect` and `repeat` |
+
+Clipping, group opacity and blur need a **layer**: an 8-bit mask of the shape's area kept while it is drawn - about
+12.5 KB for a 112 px icon, about 225 KB for a 480 px picture - and blur needs time on top. That is why these features
+form their own version: a device short of memory reads version 1 and refuses a version 2 picture cleanly, while the
+converter writes version 1 for every picture that needs none of them.
 
 ## Repository
 
@@ -127,6 +189,7 @@ Not in the format (the converter reports them): text, images, masks, clipping, f
 | `src/` | the library: `mcuvg.{h,c}` (decoder), `mcuvg_raster.{h,c}` (rasteriser) |
 | `tools/svg2mcuvg.py`, `tools/mcuvg_gui.py` | the converter, command line and window |
 | `tools/mcuvg.py`, `tools/svgfront.py` | encoder and reference decoder, SVG front end |
+| `tools/ttf.py` | TrueType glyph outlines for `<text>` (no dependency) |
 | `tools/vg_check.py`, `tools/mcuvg_check.py`, `tools/vg_sizes.py`, `tools/vg_quality.py` | checks against resvg, decoder vs reference, sizes, quality levels |
 | `bench/m33/` | Cortex-M33 bench in QEMU, the memory-cost plugin and model, a profiler |
 | `tests/svg/` | test pictures |

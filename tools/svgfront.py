@@ -16,10 +16,15 @@ icons and flat art use and hands the encoder shapes with nothing left to resolve
   - group opacity multiplied into each shape's alpha (an approximation: overlapping shapes of one group see each other
     through it - the rasteriser has no layer for a true group opacity).
 
-What it cannot express is reported, never silently drawn wrong: mask, clipPath, filter, image, text, pattern, marker,
-dashes, gradient spread other than pad.  The encoder decides what to do with each report (refuse, or drop and warn).
+  - text and markers turned into ordinary paths here (the format and the device need neither): <text> and <tspan>
+    through the glyph outlines of a TrueType font found by its family (tools/ttf.py), markers (marker-start / -mid /
+    -end) placed at the path's vertices with their orientation and units; each is reported as converted.
+
+What it cannot express is reported, never silently drawn wrong: mask, clipPath, filter, image, pattern, dashes,
+gradient spread other than pad.  The encoder decides what to do with each report (refuse, or drop and warn).
 """
 import math
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -27,17 +32,58 @@ import xml.etree.ElementTree as ET
 NS = "{http://www.w3.org/2000/svg}"
 XLINK = "{http://www.w3.org/1999/xlink}href"
 
-NAMED = {
-    "black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0), "lime": (0, 255, 0), "green": (0, 128, 0),
-    "blue": (0, 0, 255), "yellow": (255, 255, 0), "cyan": (0, 255, 255), "aqua": (0, 255, 255),
-    "magenta": (255, 0, 255), "fuchsia": (255, 0, 255), "gray": (128, 128, 128), "grey": (128, 128, 128),
-    "silver": (192, 192, 192), "maroon": (128, 0, 0), "olive": (128, 128, 0), "purple": (128, 0, 128),
-    "teal": (0, 128, 128), "navy": (0, 0, 128), "orange": (255, 165, 0), "pink": (255, 192, 203),
-    "brown": (165, 42, 42), "gold": (255, 215, 0), "transparent": None,
+NAMED = {                  # the CSS colour keywords (148), and transparent
+    "aliceblue": (240, 248, 255), "antiquewhite": (250, 235, 215), "aqua": (0, 255, 255),
+    "aquamarine": (127, 255, 212), "azure": (240, 255, 255), "beige": (245, 245, 220), "bisque": (255, 228, 196),
+    "black": (0, 0, 0), "blanchedalmond": (255, 235, 205), "blue": (0, 0, 255), "blueviolet": (138, 43, 226),
+    "brown": (165, 42, 42), "burlywood": (222, 184, 135), "cadetblue": (95, 158, 160), "chartreuse": (127, 255, 0),
+    "chocolate": (210, 105, 30), "coral": (255, 127, 80), "cornflowerblue": (100, 149, 237),
+    "cornsilk": (255, 248, 220), "crimson": (220, 20, 60), "cyan": (0, 255, 255), "darkblue": (0, 0, 139),
+    "darkcyan": (0, 139, 139), "darkgoldenrod": (184, 134, 11), "darkgray": (169, 169, 169),
+    "darkgreen": (0, 100, 0), "darkgrey": (169, 169, 169), "darkkhaki": (189, 183, 107),
+    "darkmagenta": (139, 0, 139), "darkolivegreen": (85, 107, 47), "darkorange": (255, 140, 0),
+    "darkorchid": (153, 50, 204), "darkred": (139, 0, 0), "darksalmon": (233, 150, 122),
+    "darkseagreen": (143, 188, 143), "darkslateblue": (72, 61, 139), "darkslategray": (47, 79, 79),
+    "darkslategrey": (47, 79, 79), "darkturquoise": (0, 206, 209), "darkviolet": (148, 0, 211),
+    "deeppink": (255, 20, 147), "deepskyblue": (0, 191, 255), "dimgray": (105, 105, 105), "dimgrey": (105, 105, 105),
+    "dodgerblue": (30, 144, 255), "firebrick": (178, 34, 34), "floralwhite": (255, 250, 240),
+    "forestgreen": (34, 139, 34), "fuchsia": (255, 0, 255), "gainsboro": (220, 220, 220),
+    "ghostwhite": (248, 248, 255), "gold": (255, 215, 0), "goldenrod": (218, 165, 32), "gray": (128, 128, 128),
+    "green": (0, 128, 0), "greenyellow": (173, 255, 47), "grey": (128, 128, 128), "honeydew": (240, 255, 240),
+    "hotpink": (255, 105, 180), "indianred": (205, 92, 92), "indigo": (75, 0, 130), "ivory": (255, 255, 240),
+    "khaki": (240, 230, 140), "lavender": (230, 230, 250), "lavenderblush": (255, 240, 245),
+    "lawngreen": (124, 252, 0), "lemonchiffon": (255, 250, 205), "lightblue": (173, 216, 230),
+    "lightcoral": (240, 128, 128), "lightcyan": (224, 255, 255), "lightgoldenrodyellow": (250, 250, 210),
+    "lightgray": (211, 211, 211), "lightgreen": (144, 238, 144), "lightgrey": (211, 211, 211),
+    "lightpink": (255, 182, 193), "lightsalmon": (255, 160, 122), "lightseagreen": (32, 178, 170),
+    "lightskyblue": (135, 206, 250), "lightslategray": (119, 136, 153), "lightslategrey": (119, 136, 153),
+    "lightsteelblue": (176, 196, 222), "lightyellow": (255, 255, 224), "lime": (0, 255, 0),
+    "limegreen": (50, 205, 50), "linen": (250, 240, 230), "magenta": (255, 0, 255), "maroon": (128, 0, 0),
+    "mediumaquamarine": (102, 205, 170), "mediumblue": (0, 0, 205), "mediumorchid": (186, 85, 211),
+    "mediumpurple": (147, 112, 219), "mediumseagreen": (60, 179, 113), "mediumslateblue": (123, 104, 238),
+    "mediumspringgreen": (0, 250, 154), "mediumturquoise": (72, 209, 204), "mediumvioletred": (199, 21, 133),
+    "midnightblue": (25, 25, 112), "mintcream": (245, 255, 250), "mistyrose": (255, 228, 225),
+    "moccasin": (255, 228, 181), "navajowhite": (255, 222, 173), "navy": (0, 0, 128), "oldlace": (253, 245, 230),
+    "olive": (128, 128, 0), "olivedrab": (107, 142, 35), "orange": (255, 165, 0), "orangered": (255, 69, 0),
+    "orchid": (218, 112, 214), "palegoldenrod": (238, 232, 170), "palegreen": (152, 251, 152),
+    "paleturquoise": (175, 238, 238), "palevioletred": (219, 112, 147), "papayawhip": (255, 239, 213),
+    "peachpuff": (255, 218, 185), "peru": (205, 133, 63), "pink": (255, 192, 203), "plum": (221, 160, 221),
+    "powderblue": (176, 224, 230), "purple": (128, 0, 128), "rebeccapurple": (102, 51, 153), "red": (255, 0, 0),
+    "rosybrown": (188, 143, 143), "royalblue": (65, 105, 225), "saddlebrown": (139, 69, 19),
+    "salmon": (250, 128, 114), "sandybrown": (244, 164, 96), "seagreen": (46, 139, 87), "seashell": (255, 245, 238),
+    "sienna": (160, 82, 45), "silver": (192, 192, 192), "skyblue": (135, 206, 235), "slateblue": (106, 90, 205),
+    "slategray": (112, 128, 144), "slategrey": (112, 128, 144), "snow": (255, 250, 250),
+    "springgreen": (0, 255, 127), "steelblue": (70, 130, 180), "tan": (210, 180, 140), "teal": (0, 128, 128),
+    "thistle": (216, 191, 216), "tomato": (255, 99, 71), "turquoise": (64, 224, 208), "violet": (238, 130, 238),
+    "wheat": (245, 222, 179), "white": (255, 255, 255), "whitesmoke": (245, 245, 245), "yellow": (255, 255, 0),
+    "yellowgreen": (154, 205, 50),
+    "transparent": None,
 }
 
 INHERITED = ("fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "fill-rule",
-             "fill-opacity", "stroke-opacity", "color", "stroke-dasharray", "visibility", "display")
+             "fill-opacity", "stroke-opacity", "color", "stroke-dasharray", "visibility", "display",
+             "font-family", "font-size", "font-weight", "font-style", "text-anchor", "letter-spacing",
+             "marker-start", "marker-mid", "marker-end")
 NOT_INHERITED = ("opacity", "transform", "stop-color", "stop-opacity", "clip-path", "mask", "filter")
 
 # ---- numbers and matrices ------------------------------------------------------------------------------------------
@@ -139,7 +185,21 @@ def parse_color(s, current=None):
             p = parts[3]
             a = round(float(p[:-1]) * 2.55) if p.endswith("%") else round(float(p) * 255)
         return tuple(max(0, min(255, v)) for v in ch) + (max(0, min(255, a)),)
-    rgb = NAMED.get(s.lower(), (0, 0, 0))
+    m = re.match(r"hsla?\(([^)]*)\)", s)
+    if m:                                       # hsl(h s% l%) and hsla(): CSS Color 3/4, commas or spaces
+        parts = [p.strip() for p in re.split(r"[,\s/]+", m.group(1)) if p.strip()]
+        h = float(parts[0].replace("deg", "")) % 360 / 360
+        sat, lig = (float(v.rstrip("%")) / 100 for v in parts[1:3])
+        a = 255
+        if len(parts) > 3:
+            p = parts[3]
+            a = round(float(p[:-1]) * 2.55) if p.endswith("%") else round(float(p) * 255)
+        import colorsys
+        r, g, b = colorsys.hls_to_rgb(h, lig, sat)
+        return tuple(max(0, min(255, round(v * 255))) for v in (r, g, b)) + (max(0, min(255, a)),)
+    if s.lower() not in NAMED:
+        raise ValueError(f"colour {s!r} not understood")
+    rgb = NAMED[s.lower()]
     return None if rgb is None else rgb + (255,)
 
 
@@ -423,6 +483,9 @@ class Doc:
         self.vb = (0.0, 0.0, 0.0, 0.0)
         self.shapes = []           # dicts: segs, fill, stroke, width, cap, join, miter, rule
         self.dropped = []          # (what, why)
+        self.converted = []        # (what, how): text and markers turned into ordinary paths here
+        self.root = None
+        self.fontfaces = {}        # @font-face: family (lower case) -> a TrueType file next to the SVG
 
 
 def css_rules(root):
@@ -430,6 +493,8 @@ def css_rules(root):
     for st in root.iter(NS + "style"):
         txt = re.sub(r"/\*.*?\*/", "", st.text or "", flags=re.S)
         for sel, body in re.findall(r"([^{}]+)\{([^}]*)\}", txt):
+            if sel.strip().startswith("@"):         # @font-face and other at-rules: not selectors
+                continue
             decl = parse_style(body)
             for one in sel.split(","):
                 one = one.strip()
@@ -465,6 +530,10 @@ def gradient(doc, defs, gid, bbox, m, rules, seen=()):
     el = defs.get(gid)
     if el is None or gid in seen:
         doc.dropped.append(("paint", f"url(#{gid}) not found"))
+        return None
+    kind = el.tag.replace(NS, "") if isinstance(el.tag, str) else ""
+    if kind not in ("linearGradient", "radialGradient"):   # a pattern (or anything else): not a paint of the format
+        doc.dropped.append(("paint", f"url(#{gid}) is a {kind or 'non-paint'}: not drawn"))
         return None
     chain = [el]
     while True:
@@ -518,6 +587,8 @@ def gradient(doc, defs, gid, bbox, m, rules, seen=()):
     rx, ry = math.dist(C, R[0]), math.dist(C, R[1])
     if abs(rx - ry) > 0.02 * max(rx, ry):
         doc.dropped.append(("paint", f"#{gid}: elliptic radial gradient drawn as circular"))
+    if math.dist(c, f) > 0.01 * max(r, 1e-9):
+        doc.dropped.append(("paint", f"#{gid}: the focal point (fx, fy) ignored - drawn from the centre"))
     return ("radial", C, (rx + ry) / 2, stops, mat_apply(full, *f))
 
 
@@ -539,6 +610,17 @@ def load(path_or_text):
             text = f.read().decode("utf-8", "replace")
     root = ET.fromstring(text)
     doc = Doc()
+    doc.root = root
+    here = os.path.dirname(os.path.abspath(path_or_text)) if text is not path_or_text else os.getcwd()
+    for st in root.iter(NS + "style"):           # @font-face { font-family: X; src: url(file.ttf) }: the file's own fonts
+        for body in re.findall(r"@font-face\s*\{([^}]*)\}", st.text or ""):
+            d = parse_style(body)
+            fam = (d.get("font-family") or "").strip().strip("'\"").lower()
+            src = re.search(r"url\(\s*['\"]?([^)'\"]+)['\"]?\s*\)", d.get("src") or "")
+            if fam and src and src.group(1).lower().endswith((".ttf", ".ttc")):
+                f = os.path.normpath(os.path.join(here, src.group(1)))
+                if os.path.exists(f):
+                    doc.fontfaces[fam] = f
     vb = nums(root.get("viewBox"))
     w = length(root.get("width"), default=vb[2] if len(vb) == 4 else 0)
     h = length(root.get("height"), default=vb[3] if len(vb) == 4 else 0)
@@ -555,7 +637,31 @@ def load(path_or_text):
 
 SKIP_SUBTREE = ("defs", "style", "title", "desc", "metadata", "linearGradient", "radialGradient", "symbol",
                 "clipPath", "mask", "pattern", "marker", "filter")
-UNSUPPORTED = ("image", "text", "foreignObject", "switch")
+UNSUPPORTED = ("image", "foreignObject", "switch")
+
+
+def viewport(el):
+    """a nested <svg>'s matrix: its viewBox fitted into (x, y, width, height) by preserveAspectRatio (meet / slice,
+    the nine alignments, none). Its content is not clipped to the viewport (no clipping in version 1)"""
+    x, y = length(el.get("x")), length(el.get("y"))
+    vb = nums(el.get("viewBox"))
+    w = length(el.get("width"), 1.0, vb[2] if len(vb) == 4 else 0.0)
+    h = length(el.get("height"), 1.0, vb[3] if len(vb) == 4 else 0.0)
+    if len(vb) != 4 or vb[2] <= 0 or vb[3] <= 0 or w <= 0 or h <= 0:
+        return (1.0, 0.0, 0.0, 1.0, x, y)
+    sx, sy = w / vb[2], h / vb[3]
+    par = (el.get("preserveAspectRatio") or "xMidYMid meet").split()
+    if par and par[0] == "defer":
+        par = par[1:] or ["xMidYMid"]
+    align = par[0] if par else "xMidYMid"
+    if align != "none":
+        k = max(sx, sy) if len(par) > 1 and par[1] == "slice" else min(sx, sy)
+        sx = sy = k
+        ax = {"xMin": 0.0, "xMid": 0.5, "xMax": 1.0}.get(align[:4], 0.5)
+        ay = {"YMin": 0.0, "YMid": 0.5, "YMax": 1.0}.get(align[4:], 0.5)
+        x += (w - vb[2] * sx) * ax
+        y += (h - vb[3] * sy) * ay
+    return (sx, 0.0, 0.0, sy, x - vb[0] * sx, y - vb[1] * sy)
 
 
 def walk(doc, el, tag, inh, m, opa, defs, rules, in_use):
@@ -572,8 +678,8 @@ def walk(doc, el, tag, inh, m, opa, defs, rules, in_use):
         if st.get(k) and st[k] != "none":
             doc.dropped.append((tag, f"{k}={st[k]} ignored"))
     if tag in ("svg", "g", "a"):
-        if tag == "svg" and el is not None and doc.shapes is not None and el.get("x"):
-            m = mat_mul(m, (1, 0, 0, 1, length(el.get("x")), length(el.get("y"))))
+        if tag == "svg" and el is not doc.root:   # a nested viewport: x, y, width, height and its viewBox
+            m = mat_mul(m, viewport(el))
         for ch in el:
             t = ch.tag.replace(NS, "") if isinstance(ch.tag, str) else ""
             if t in SKIP_SUBTREE or not t:
@@ -595,23 +701,42 @@ def walk(doc, el, tag, inh, m, opa, defs, rules, in_use):
             t = "g"
         walk(doc, ref, t, cur, m2, opa, defs, rules, True)
         return
+    if tag == "text":
+        text_shapes(doc, el, cur, m, opa, defs, rules)
+        return
     segs = shape_segs(el, tag, st)
     if not segs:
         if tag not in ("path", "rect", "circle", "ellipse", "line", "polyline", "polygon"):
             doc.dropped.append((tag, "unknown element"))
         return
+    emit(doc, tag, segs, cur, m, opa, defs, rules)
+    if tag in ("path", "line", "polyline", "polygon"):
+        markers(doc, segs, cur, m, opa, defs, rules)
+
+
+def emit(doc, tag, segs, cur, m, opa, defs, rules):
+    """one outline in its element's own coordinates -> a shape of the picture: its paints resolved, its stroke width
+    taken through the matrix, the matrix applied"""
     if cur.get("visibility") in ("hidden", "collapse"):
         return
     bbox = segs_bbox(segs)
     color = cur.get("color")
 
     def paint(key, okey):
-        c = parse_color(cur.get(key), color)
+        try:
+            c = parse_color(cur.get(key), color)
+        except ValueError as e:                   # reported, not drawn black
+            doc.dropped.append((tag, f"{key}: {e}"))
+            return None
         if c is None:
             return None
         k = opa * float(cur.get(okey, "1"))
         if c[0] == "url":
-            p = gradient(doc, defs, c[1], bbox, m, rules)
+            try:
+                p = gradient(doc, defs, c[1], bbox, m, rules)
+            except ValueError as e:
+                doc.dropped.append((tag, f"{key}: {e}"))
+                return None
             if p is None:
                 return None
             return scale_alpha(p, k)
@@ -645,6 +770,221 @@ def walk(doc, el, tag, inh, m, opa, defs, rules, in_use):
     })
 
 
+# ---- markers: copies of the marker's content at the path's vertices ----------------------------------------------------
+
+def _unit(d):
+    if d is None:
+        return None
+    n = math.hypot(d[0], d[1])
+    return (d[0] / n, d[1] / n) if n > 1e-12 else None
+
+
+def vertices(segs):
+    """the path's vertices in order (subpath starts, segment ends): [x, y, incoming direction, outgoing direction]"""
+    out = []
+    cx = cy = sx = sy = 0.0
+    for s in segs:
+        op = s[0]
+        if op == "M":
+            cx, cy = sx, sy = s[1], s[2]
+            out.append([cx, cy, None, None])
+            continue
+        if not out:
+            out.append([cx, cy, None, None])
+        if op == "Z":
+            if abs(cx - sx) > 1e-9 or abs(cy - sy) > 1e-9:
+                d = (sx - cx, sy - cy)
+                out[-1][3] = d
+                out.append([sx, sy, d, None])
+            cx, cy = sx, sy
+            continue
+        if op == "L":
+            dout = din = (s[1] - cx, s[2] - cy)
+            ex, ey = s[1], s[2]
+        elif op == "Q":
+            dout, din = (s[1] - cx, s[2] - cy), (s[3] - s[1], s[4] - s[2])
+            ex, ey = s[3], s[4]
+        elif op == "C":
+            dout = (s[1] - cx, s[2] - cy) if (s[1], s[2]) != (cx, cy) else (s[3] - cx, s[4] - cy)
+            din = (s[5] - s[3], s[6] - s[4]) if (s[3], s[4]) != (s[5], s[6]) else (s[5] - s[1], s[6] - s[2])
+            ex, ey = s[5], s[6]
+        else:                                   # "A"
+            cs = arc_to_cubics(cx, cy, *s[1:])
+            a, z = cs[0], cs[-1]
+            dout = (a[1] - cx, a[2] - cy)
+            din = (z[-2] - z[-4], z[-1] - z[-3]) if z[0] == "C" else (z[1] - cx, z[2] - cy)
+            ex, ey = s[6], s[7]
+        out[-1][3] = dout
+        out.append([ex, ey, din, None])
+        cx, cy = ex, ey
+    return out
+
+
+def _url(v):
+    v = (v or "").strip()
+    return v[5:-1].strip().lstrip("#") if v.startswith("url(") and v.endswith(")") else None
+
+
+def markers(doc, segs, cur, m, opa, defs, rules):
+    ids = {k: _url(cur.get(k) or cur.get("marker")) for k in ("marker-start", "marker-mid", "marker-end")}
+    if not any(ids.values()):
+        return
+    vs = vertices(segs)
+    sw = length(cur.get("stroke-width"), 1.0, 1.0)
+    placed = 0
+    for i, (x, y, din, dout) in enumerate(vs):
+        key = "marker-start" if i == 0 else "marker-end" if i == len(vs) - 1 else "marker-mid"
+        mid = ids[key]
+        if not mid:
+            continue
+        mk = defs.get(mid)
+        if mk is None or mk.tag.replace(NS, "") != "marker":
+            doc.dropped.append(("marker", f"#{mid} not found"))
+            continue
+        orient = (mk.get("orient") or "0").strip()
+        if orient in ("auto", "auto-start-reverse"):
+            a, b = _unit(din), _unit(dout)
+            d = (a[0] + b[0], a[1] + b[1]) if a and b else (a or b or (1.0, 0.0))
+            if math.hypot(*d) < 1e-9:
+                d = b or a
+            ang = math.degrees(math.atan2(d[1], d[0]))
+            if orient == "auto-start-reverse" and i == 0:
+                ang += 180.0
+        else:
+            ang = float(orient.replace("deg", "") or 0)
+        vb = nums(mk.get("viewBox"))
+        mw, mh = length(mk.get("markerWidth"), 1.0, 3.0), length(mk.get("markerHeight"), 1.0, 3.0)
+        k = sw if (mk.get("markerUnits") or "strokeWidth") == "strokeWidth" else 1.0
+        if len(vb) == 4 and vb[2] > 0 and vb[3] > 0:
+            k *= min(mw / vb[2], mh / vb[3])
+        r = math.radians(ang)
+        M = mat_mul(m, (1.0, 0.0, 0.0, 1.0, x, y))
+        M = mat_mul(M, (math.cos(r), math.sin(r), -math.sin(r), math.cos(r), 0.0, 0.0))
+        M = mat_mul(M, (k, 0.0, 0.0, k, 0.0, 0.0))
+        M = mat_mul(M, (1.0, 0.0, 0.0, 1.0, -length(mk.get("refX")), -length(mk.get("refY"))))
+        inh = {"fill": "black", "stroke": "none", "stroke-width": "1"}
+        mst = own_style(mk, "marker", rules)
+        for kk in INHERITED:
+            if kk in mst and mst[kk] != "inherit":
+                inh[kk] = mst[kk]
+        for ch in mk:
+            t = ch.tag.replace(NS, "") if isinstance(ch.tag, str) else ""
+            if t and t not in SKIP_SUBTREE and t not in UNSUPPORTED:
+                walk(doc, ch, t, inh, M, opa, defs, rules, True)
+        placed += 1
+    if placed:
+        doc.converted.append(("marker", f"{placed} placed as paths"))
+
+
+# ---- text: glyph outlines of a TrueType font -----------------------------------------------------------------------
+
+_FONTS = {}
+
+
+def _font(cur, doc=None):
+    import ttf
+    fams = [f for f in (cur.get("font-family") or "sans-serif").split(",") if f.strip()]
+    for f in fams:                               # the file's own @font-face first
+        fp = doc.fontfaces.get(f.strip().strip("'\"").lower()) if doc else None
+        if fp:
+            if fp not in _FONTS:
+                try:
+                    _FONTS[fp] = ttf.Font(fp)
+                except Exception as e:           # noqa: BLE001 - a bad font file is reported, the next family tried
+                    doc.dropped.append(("text", f"@font-face {fp}: {e}"))
+                    _FONTS[fp] = None
+            if _FONTS[fp]:
+                return _FONTS[fp]
+    w = (cur.get("font-weight") or "normal").strip()
+    bold = w in ("bold", "bolder") or (w.isdigit() and int(w) >= 600)
+    italic = (cur.get("font-style") or "normal").strip() in ("italic", "oblique")
+    key = (tuple(f.strip().lower() for f in fams), bold, italic)
+    if key not in _FONTS:
+        f = ttf.find(fams, bold, italic)
+        if f is None and not any(x.strip().strip("'\"").lower() == "sans-serif" for x in fams):
+            f = ttf.find(["sans-serif"], bold, italic)
+        _FONTS[key] = f
+    return _FONTS[key]
+
+
+def text_shapes(doc, el, cur, m, opa, defs, rules):
+    """<text> and its <tspan>s -> paths: runs of characters, each in its own style, laid out one glyph after another on
+    the baseline (no kerning, no shaping); text-anchor moves the whole line"""
+    import ttf
+    runs = []                                    # [text, style, x or None, y or None]
+
+    def first(v):
+        n = nums(v)
+        return n[0] if n else None
+
+    def collect(e, c, x, y):
+        if e.text:
+            runs.append([e.text, c, x, y])
+            x = y = None
+        for ch in e:
+            t = ch.tag.replace(NS, "") if isinstance(ch.tag, str) else ""
+            if t == "tspan":
+                st = own_style(ch, t, rules)
+                c2 = dict(c)
+                for kk in INHERITED:
+                    if kk in st and st[kk] != "inherit":
+                        c2[kk] = st[kk]
+                collect(ch, c2, first(ch.get("x")), first(ch.get("y")))
+            elif t:
+                doc.dropped.append((t, "inside <text>: not drawn"))
+            if ch.tail:
+                runs.append([ch.tail, c, None, None])
+
+    collect(el, cur, first(el.get("x")) or 0.0, first(el.get("y")) or 0.0)
+    if not runs:
+        return
+    keep = el.get("{http://www.w3.org/XML/1998/namespace}space") == "preserve"
+    for r in runs:                               # xml:space default: whitespace collapsed
+        r[0] = r[0].replace("\n", " ").replace("\t", " ")
+        if not keep:
+            r[0] = re.sub(" +", " ", r[0])
+    if not keep:
+        runs[0][0] = runs[0][0].lstrip()
+        runs[-1][0] = runs[-1][0].rstrip()
+    anchor = (cur.get("text-anchor") or "start").strip()
+    x, y = runs[0][2] or 0.0, runs[0][3] or 0.0
+    lines, line = [], []
+    for r in runs:                               # a run with its own x or y starts a new chunk (anchored on its own)
+        if line and (r[2] is not None or r[3] is not None):
+            lines.append(line)
+            line = []
+        line.append(r)
+    lines.append(line)
+    for line in lines:
+        x = line[0][2] if line[0][2] is not None else x
+        y = line[0][3] if line[0][3] is not None else y
+        laid, total = [], 0.0
+        for s, c, _x, _y in line:
+            if not s:
+                continue
+            f = _font(c, doc)
+            if f is None:
+                doc.dropped.append(("text", f"no TrueType font for '{c.get('font-family') or 'sans-serif'}'"))
+                continue
+            size = length(c.get("font-size"), 16.0, 16.0)
+            sp = length(c.get("letter-spacing"), size, 0.0) if (c.get("letter-spacing") or "normal") != "normal" else 0.0
+            _segs, adv, missing = ttf.text_segs(f, s, 0.0, 0.0, size, "start", sp)
+            if missing:
+                doc.dropped.append(("text", f"no glyph for {''.join(missing)!r} in {f.family} {f.style}"))
+            laid.append((s, c, f, size, sp))
+            total += adv
+        x0 = x - (total / 2 if anchor == "middle" else total if anchor == "end" else 0.0)
+        for s, c, f, size, sp in laid:
+            segs, adv, _ = ttf.text_segs(f, s, x0, y, size, "start", sp)
+            if segs:
+                c2 = dict(c)
+                c2["fill-rule"] = "nonzero"              # TrueType outlines wind non-zero
+                emit(doc, "text", segs, c2, m, opa, defs, rules)
+                doc.converted.append(("text", f"{s!r} -> outlines, {f.family} {f.style} {size:g} px"))
+            x0 += adv
+        x = x0
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
@@ -655,6 +995,8 @@ def main():
         ops = "".join(seg[0] for seg in s["segs"])
         print(f"  {i:3d} {s['tag']:8s} fill {s['fill'] and s['fill'][0]} stroke {s['stroke'] and s['stroke'][0]}"
               f" w {s['width']:.2f} {s['rule']} segs {len(s['segs'])} {ops[:60]}")
+    for what, how in d.converted:
+        print(f"  converted {what}: {how}")
     for what, why in d.dropped:
         print(f"  dropped {what}: {why}")
 
