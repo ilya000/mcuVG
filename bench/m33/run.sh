@@ -12,7 +12,8 @@ TC="${ARM_GCC_BIN:-$(dirname "$(command -v arm-none-eabi-gcc)")}"
 mkdir -p "$D/out"
 python3 "$D/gen_icons.py"
 AF="-mcpu=cortex-m33 -mthumb -mfpu=fpv5-sp-d16 -mfloat-abi=hard -std=c99 -ffunction-sections -fdata-sections -Wall -Wextra
-    -ffreestanding -fno-tree-loop-distribute-patterns -fno-common -ffp-contract=off -fno-math-errno -I$V -I$D"
+    -ffreestanding -fno-tree-loop-distribute-patterns -fno-common -ffp-contract=off -fno-math-errno -I$V -I$D ${MCUVG_CFLAGS:-}"
+# MCUVG_CFLAGS=-DMCUVG_V2=0: the version 1 build a device without version 2 uses
 if [ "${1:-}" = cost ]; then
     # the plugin: qemu-plugin.h and glib's headers (Homebrew paths by default; set QEMU_INC / GLIB_CFLAGS elsewhere)
     QI="${QEMU_INC:-$(brew --prefix qemu 2>/dev/null)/include}"

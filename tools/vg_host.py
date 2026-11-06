@@ -160,6 +160,8 @@ class Lib:
             for f in ("mcuvg_shadow_end", "mcuvg_group_end"):
                 getattr(L, f).argtypes = [C.c_void_p]
             L.mcuvg_clip_path.argtypes = [C.c_void_p, C.c_int]
+            L.mcuvg_layers_used.argtypes = [C.c_void_p]
+            L.mcuvg_layers_used.restype = C.c_size_t
         self.ctx = C.create_string_buffer(16384)          # sizeof(mcuvg_ctx) with version 2's frames
         self.layers = C.create_string_buffer(8 << 20)
 
@@ -201,6 +203,10 @@ class Lib:
         p, e = C.c_uint32(), C.c_uint32()
         self.L.mcuvg_usage(self.ctx, C.byref(p), C.byref(e))
         return p.value, e.value
+
+    def layers_used(self):
+        """the most layer memory (version 2) held at once since the context was made"""
+        return self.L.mcuvg_layers_used(self.ctx) if self.v2 else 0
 
     def block_size(self, w, points, edges):
         return self.L.mcuvg_mem(w, points, edges)

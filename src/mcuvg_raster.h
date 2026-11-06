@@ -115,7 +115,7 @@ typedef struct {
     int mx0, my0, mw, mh;              /* ... its box in the first target's pixels */
     int ox, oy;                        /* the target drawn into, in the first target's pixels (a layer's corner) */
     uint8_t *lm;                       /* the layers' memory (mcuvg_layers), used as a stack */
-    size_t llen, lused;
+    size_t llen, lused, lhw;           /* lhw: the most it held since mcuvg_layers */
     int depth;
     struct mcuvg_frame {               /* a group or a shadow pass in progress */
         void *px; int w, h, stride, fmt, cx0, cy0, cx1, cy1, ox, oy;
@@ -180,6 +180,7 @@ int mcuvg_stroke(mcuvg_ctx *c, const mcuvg_paint *p, float width, int cap, int j
    again, mcuvg_group_end.  A clip: mcuvg_group_begin, a path, mcuvg_clip_path, what it clips, mcuvg_group_end. */
 int mcuvg_dash(mcuvg_ctx *c, const float *len, int n, float offset);
 void mcuvg_layers(mcuvg_ctx *c, void *mem, size_t len);
+size_t mcuvg_layers_used(const mcuvg_ctx *c);   /* the most layer memory held at once since mcuvg_layers (sizing) */
 int mcuvg_shadow_begin(mcuvg_ctx *c, const mcuvg_group *g);
 int mcuvg_shadow_end(mcuvg_ctx *c);
 int mcuvg_group_begin(mcuvg_ctx *c, const mcuvg_group *g);

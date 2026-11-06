@@ -111,7 +111,7 @@ int mcuvg_init(mcuvg_ctx *c, void *px, int w, int h, int stride, int fmt, void *
 #if MCUVG_V2
     c->ndash = 0; c->dash_off = 0;
     c->mask = 0; c->mx0 = c->my0 = c->mw = c->mh = 0; c->ox = c->oy = 0;
-    c->lm = 0; c->llen = c->lused = 0; c->depth = 0;
+    c->lm = 0; c->llen = c->lused = c->lhw = 0; c->depth = 0;
 #endif
     return MCUVG_OK;
 }
@@ -453,6 +453,7 @@ struct pnt {
     float ua, ub, uc, ud, ue, uf;      /* radial: device -> the gradient's unit circle: u = ua x + uc y + ue,
                                           v = ub x + ud y + uf; t = |(u, v)| */
 #if MCUVG_V2
+    int ext;                           /* a spread or a focal point: drawn by out_run_mask, not version 1's loop */
     int spread, focal;
     float fx, fy, fr, fa, dr;          /* the focal circle in the unit circle's space; fa = |f|^2 - dr^2, dr = 1 - fr */
 #endif
@@ -471,6 +472,7 @@ static int paint_setup(mcuvg_ctx *c, const mcuvg_paint *p, struct pnt *q)
 #if MCUVG_V2
     q->spread = p->spread;
     q->focal = 0;
+    q->ext = p->spread != MCUVG_PAD;
 #endif
     if (p->kind == MCUVG_LINEAR) {
         float dx = p->x1 - p->x0, dy = p->y1 - p->y0, l2 = dx * dx + dy * dy;
@@ -502,6 +504,7 @@ static int paint_setup(mcuvg_ctx *c, const mcuvg_paint *p, struct pnt *q)
         q->focal = 1;
         q->fx = u; q->fy = v; q->fr = fr; q->dr = 1.0f - fr;
         q->fa = u * u + v * v - q->dr * q->dr;                      /* < 0: the focal circle is inside */
+        q->ext = 1;
     }
 #endif
     return 0;
@@ -526,8 +529,9 @@ static inline __attribute__((always_inline)) uint32_t lut_at(const uint32_t *lut
 }
 
 /* 8-bit channels to RGB565, rounded to the nearest level (exactly (v * 31 + 127) / 255 and (v * 63 + 127) / 255):
-   truncating instead darkened every colour by up to 7 levels of 255 in red and blue, a hue drift in dark tones */
-static inline uint32_t rgb565(uint32_t r, uint32_t g, uint32_t b)
+   truncating instead darkened every colour by up to 7 levels of 255 in red and blue, a hue drift in dark tones.
+   always_inline: at -Os GCC kept it a call per pixel, with its spills a fifth of a picture's cycles (QEMU model, 06.11) */
+static inline __attribute__((always_inline)) uint32_t rgb565(uint32_t r, uint32_t g, uint32_t b)
 {
     return ((r * 249u + 1014u) >> 11) << 11 | ((g * 253u + 505u) >> 10) << 5 | ((b * 249u + 1014u) >> 11);
 }
@@ -536,7 +540,7 @@ static inline uint32_t rgb565(uint32_t r, uint32_t g, uint32_t b)
 #if MCUVG_V2
 /* version 2: t brought into 0..1 by the spread; NO_T (a point the focal gradient does not reach) is transparent */
 #define NO_T (-1e30f)
-static inline __attribute__((always_inline)) uint32_t lut_sp(const uint32_t *lut, float t, int spread)
+static inline __attribute__((always_inline, unused)) uint32_t lut_sp(const uint32_t *lut, float t, int spread)
 {
     if (t == NO_T) return 0;
     if (spread == MCUVG_REPEAT) t -= (float)ifloor(t);
@@ -550,7 +554,7 @@ static inline __attribute__((always_inline)) uint32_t lut_sp(const uint32_t *lut
 }
 /* the focal gradient's t at (u, v) of the unit circle: the largest t whose circle - centre f + t (0 - f), radius
    fr + t (1 - fr) - passes through the point; fa < 0 (the focal circle inside) makes it one root */
-static inline __attribute__((always_inline)) float focal_t(float u, float v, float fx, float fy, float fr, float fa, float dr)
+static inline __attribute__((always_inline, unused)) float focal_t(float u, float v, float fx, float fy, float fr, float fa, float dr)
 {
     float qx = u - fx, qy = v - fy;
     float b = fr * dr - (qx * fx + qy * fy), c0 = qx * qx + qy * qy - fr * fr, disc = b * b - fa * c0;
@@ -567,22 +571,16 @@ static void out_run_mask(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut,
 static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
 {
 #if MCUVG_V2
-    if (c->mask) { out_run_mask(c, q, lut, x0, x1, y, cv); return; }
+    /* a clip or a gradient of version 2: their own path, so version 1's loop below stays exactly as fast */
+    if (q->ext || c->mask) { out_run_mask(c, q, lut, x0, x1, y, cv); return; }
 #endif
     int n = x1 - x0;
     const int lin = q->kind == MCUVG_LINEAR;
     const float ga = q->ga, gb = q->gb, gc = q->gc;
     const float ua = q->ua, ub = q->ub, uc = q->uc, ud = q->ud, ue = q->ue, uf = q->uf;
-#if MCUVG_V2
-    const int spread = q->spread, focal = q->focal;
-    const float ffx = q->fx, ffy = q->fy, ffr = q->fr, ffa = q->fa, fdr = q->dr;
-#define RAD_T(U, V) (focal ? focal_t((U), (V), ffx, ffy, ffr, ffa, fdr) : mcuvg_sqrt((U) * (U) + (V) * (V)))
-#define PAINT(X) lut_sp(lut, lin ? ga * (X) + gb * fy + gc : RAD_T(ua * (X) + uc * fy + ue, ub * (X) + ud * fy + uf), spread)
-#else
 #define PAINT(X) (lin ? lut_at(lut, ga * (X) + gb * fy + gc) \
                       : lut_at(lut, mcuvg_sqrt((ua * (X) + uc * fy + ue) * (ua * (X) + uc * fy + ue) + \
                                                (ub * (X) + ud * fy + uf) * (ub * (X) + ud * fy + uf))))
-#endif
     uint8_t *rowp = (uint8_t *)c->px + (size_t)y * (size_t)c->stride;
     uint32_t f = q->kind == MCUVG_FLAT ? (cv == 256u ? q->flat : scale_px(q->flat, cv)) : 0u;
     int flat = q->kind == MCUVG_FLAT;
@@ -655,9 +653,6 @@ static void out_run(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int 
 }
 
 #undef PAINT
-#if MCUVG_V2
-#undef RAD_T
-#endif
 
 /* the flat-colour RGB565 case (icons, an application's raster) without a call per pixel: inlined into the sweep, so
    the colour and the row stay in registers (a call with its spills costs more than the pixel on an uncached core) */
@@ -688,7 +683,7 @@ static inline __attribute__((always_inline)) void fill565(uint16_t *d, int n, ui
     }
 }
 
-static inline uint32_t cov_of(float acc, int rule)
+static inline __attribute__((always_inline)) uint32_t cov_of(float acc, int rule)   /* a call each pixel otherwise */
 {
     float v = fabs_(acc);
     if (rule == MCUVG_EVENODD) { v -= 2.0f * (float)ifloor(v * 0.5f); if (v > 1) v = 2 - v; }
@@ -1116,7 +1111,10 @@ void mcuvg_layers(mcuvg_ctx *c, void *mem, size_t len)
     c->lm = mem && len > skip ? p : 0;
     c->llen = mem && len > skip ? len - skip : 0;
     c->lused = 0;
+    c->lhw = 0;
 }
+
+size_t mcuvg_layers_used(const mcuvg_ctx *c) { return c->lhw; }
 
 static uint8_t *lalloc(mcuvg_ctx *c, size_t n)            /* zeroed */
 {
@@ -1124,6 +1122,7 @@ static uint8_t *lalloc(mcuvg_ctx *c, size_t n)            /* zeroed */
     if (!c->lm || n > c->llen - c->lused) return 0;
     uint8_t *p = c->lm + c->lused;
     c->lused += n;
+    if (c->lused > c->lhw) c->lhw = c->lused;
     uint32_t *w = (uint32_t *)(void *)p;
     for (size_t i = 0; i < n / 4u; i++) w[i] = 0;
     return p;
@@ -1213,14 +1212,15 @@ static uint32_t paint_px(const struct pnt *q, const uint32_t *lut, float X, floa
     return lut_sp(lut, q->focal ? focal_t(u, v, q->fx, q->fy, q->fr, q->fa, q->dr) : mcuvg_sqrt(u * u + v * v), q->spread);
 }
 
-/* out_run under a clip: the paint and the coverage times the mask, pixel by pixel, then over the target */
+/* out_run under a clip, or with a gradient of version 2: pixel by pixel (the coverage times the mask), then over the
+   target */
 static void out_run_mask(mcuvg_ctx *c, const struct pnt *q, const uint32_t *lut, int x0, int x1, int y, uint32_t cv)
 {
     float fy = (float)y + 0.5f;
     while (x0 < x1) {
         int n = x1 - x0 < c->w ? x1 - x0 : c->w;
         for (int i = 0; i < n; i++) {
-            uint32_t m = mask_at(c, x0 + i + c->ox, y + c->oy), k = (cv * m + 127u) / 255u;
+            uint32_t k = c->mask ? (cv * mask_at(c, x0 + i + c->ox, y + c->oy) + 127u) / 255u : cv;
             c->pix[i] = k ? scale_px(paint_px(q, lut, (float)(x0 + i) + 0.5f, fy), k) : 0u;
         }
         blend_row(c, x0, y, n, c->pix);

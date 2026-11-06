@@ -101,6 +101,7 @@ struct dec {
     int32_t arot;
     int have_path;
     int depth;
+    int dashed;            /* a dash record is in force (for the next shape) */
 };
 
 static uint32_t color(struct dec *d, uint32_t i)
@@ -268,7 +269,7 @@ static int shape(struct dec *d, mcuvg_ctx *c, uint32_t kind)
         if (rc) return rc;
     }
 #if MCUVG_V2
-    mcuvg_dash(c, 0, 0, 0);                         /* a dash record holds for one shape */
+    if (d->dashed) { mcuvg_dash(c, 0, 0, 0); d->dashed = 0; }   /* a dash record holds for one shape */
 #endif
     return MCUVG_OK;
 }
@@ -341,6 +342,7 @@ static int dash(struct dec *d, mcuvg_ctx *c)
     for (uint32_t i = 0; i < n; i++) v[i] = (float)vu(&d->r) * d->k;
     float off = (float)zv(&d->r) * d->k;
     if (d->r.err) return MCUVG_E_ARG;
+    d->dashed = 1;
     return mcuvg_dash(c, v, (int)n, off) ? MCUVG_E_ARG : MCUVG_OK;
 }
 #endif
@@ -378,7 +380,7 @@ int mcuvg_draw(mcuvg_ctx *c, const void *data, uint32_t len, const uint32_t *rec
     int rc = mcuvg_head(data, len, &in);
     if (rc) return rc;
     struct dec d = { { (const uint8_t *)data, in.body_off, len, ~(uintptr_t)0, 0, 0 }, &in, recolor, nrecolor,
-                     1.0f / (float)(1u << in.grid), in.ver, 0, 0, 0, 0, 0, 0, 0 };
+                     1.0f / (float)(1u << in.grid), in.ver, 0, 0, 0, 0, 0, 0, 0, 0 };
 #if MCUVG_V2
     mcuvg_dash(c, 0, 0, 0);
 #endif
