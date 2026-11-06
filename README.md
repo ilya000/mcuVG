@@ -167,7 +167,7 @@ Simplified, and reported:
 
 ### Version 2 (in development)
 
-What designers' SVG (Figma, PlayKit-style icons) needs next:
+What designers' SVG (Figma exports, icons with a painted look) needs next:
 
 | Feature | Why |
 |---|---|
