@@ -116,7 +116,7 @@ class Enc:
 
     def encode(self):
         cmds = b""
-        for s in self.doc.shapes:
+        for s in svgfront.flat_items(self.doc.shapes):   # TinyVG has no groups: version 2's effects left out
             nseg, pdata = self.path(s["segs"])
             if not nseg:
                 continue

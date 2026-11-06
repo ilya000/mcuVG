@@ -23,6 +23,11 @@ int main(int argc, char **argv)
     void *mem = malloc(need);                                             /* on a device: a static block instead */
     mcuvg_ctx c;
     if (!px || !mem || mcuvg_init(&c, px, size, size, size * 4, MCUVG_RGBA8888, mem, need)) return 1;
+#if MCUVG_V2
+    size_t lneed = (size_t)size * (size_t)size * 6u + 65536u;            /* version 2's layers: generous here too */
+    void *layers = malloc(lneed);
+    if (layers) mcuvg_layers(&c, layers, lneed);
+#endif
     int rc = mcuvg_fit(&c, data, (uint32_t)len, 0, 0, (float)size, (float)size, 0.0f);
     if (rc) { fprintf(stderr, "mcuvg: error %d\n", rc); return 1; }
     FILE *o = fopen(argv[3], "wb");
@@ -35,5 +40,8 @@ int main(int argc, char **argv)
     fclose(o);
     free(px);
     free(mem);
+#if MCUVG_V2
+    free(layers);
+#endif
     return 0;
 }

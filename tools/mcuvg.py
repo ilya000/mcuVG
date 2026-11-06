@@ -664,9 +664,18 @@ def main():
         print(f"{len(b)} B, grid 1/{1 << Enc(doc, px, prec).F}, {len(doc.shapes)} shapes, dropped {len(doc.dropped)}")
     elif len(a) == 2 and a[0] == "dump":
         d = decode(open(a[1], "rb").read())
-        print(f"{d.w} x {d.h}, {len(d.shapes)} shapes")
-        for s in d.shapes:
-            print(" ", s["fill"] and s["fill"][0], s["stroke"] and s["stroke"][0], s["rule"], "".join(x[0] for x in s["segs"]))
+        print(f"{d.w} x {d.h}, version {open(a[1], 'rb').read()[2]}, {len(d.shapes)} items")
+
+        def show(items, ind):
+            for s in items:
+                if "group" in s:
+                    print(ind + f"group: opacity {s['opacity']:.2f}, clip {'yes' if s['clip'] else 'no'}, "
+                          f"{len(s['shadows'])} shadows, blur {s['blur']:g}, box {tuple(round(v, 2) for v in s['bbox'])}")
+                    show(s["items"], ind + "  ")
+                else:
+                    print(ind, s["fill"] and s["fill"][0], s["stroke"] and s["stroke"][0], s["rule"],
+                          "".join(x[0] for x in s["segs"]) + (f" dash {s['dash'][0]}" if s.get("dash") else ""))
+        show(d.shapes, " ")
     else:
         print(__doc__)
         sys.exit(2)
