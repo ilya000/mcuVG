@@ -1,7 +1,8 @@
 # mcuVG — MCU Vector Graphics, format specification
 
-**Draft 2, format version 1.** Status: experimental. The layout may still change before version 1.0. Every file carries
-its format version in a byte of its own (section 2.1).
+**Draft 3: format versions 1 and 2.** Status: experimental. The layout may still change before 1.0. Every file carries
+its format version in a byte of its own (section 2.1); version 2 adds clipping, shadows and glows, blur, exact group
+opacity, dashes and gradients in full (section 2.2, records in section 3.3).
 
 mcuVG is a compact binary format for vector pictures — icons, glyphs, UI shapes, flat illustrations — that a
 microcontroller draws straight from flash. Authors write SVG; a converter on a computer compiles it; the device only
@@ -25,7 +26,7 @@ decodes and rasterises.
 | Field | Size | Meaning |
 |---|---|---|
 | magic | 2 B | `'m' 'V'` (0x6D 0x56) |
-| version | 1 B | the format version, 1 … 255; this document describes version 1 |
+| version | 1 B | the format version, 1 … 255; this document describes versions 1 and 2 |
 | flags | 1 B | bits 0–3: F; bit 6: colours carry alpha; bits 4, 5, 7: 0 |
 | width | varuint | design box, units |
 | height | varuint | design box, units |
@@ -44,14 +45,17 @@ paints, fields); a file that needs none of the additions stays at the version th
 
 A decoder refuses a version newer than its own, as it refuses any other picture it cannot read (section 6).
 
-### 2.2. Version 2 (in development)
+### 2.2. Version 2
 
-Version 2 adds what needs an offscreen layer or more paint: clipping paths, soft edges with shadow and glow (a blur of a
-shape's coverage), exact group opacity, dashed strokes, and gradients in full (elliptical radial, a focal point,
-`reflect` and `repeat`). A layer costs an 8-bit mask of the affected area while it is drawn (about 12.5 KB for a 112 px
-icon, about 225 KB for a 480 px picture), so a decoder for a small device may stay at version 1: it refuses version 2
-pictures cleanly, and an encoder writes version 1 for every picture that uses none of these features (rule 2).
-This section is filled in when version 2 is fixed.
+Version 2 adds what needs a layer or more paint: groups that are clipped, cast shadows and glows, are blurred or made
+translucent as one (3.3), dashed strokes (3.3), and gradients in full - elliptical radial, a focal point, `reflect`
+and `repeat` (3.1).  A version 2 file may use version 1's records unchanged; a version 1 file holds none of these.
+
+Version 2 costs memory while a group is drawn: an 8-bit layer for a clip or a shadow, a 32-bit one for a group made
+translucent or blurred - each the size of the group's box, clipped to the target (for a 112 px icon from ~8 KB for a
+shadow to ~46 KB for a blur; up to ~0.8 MB for a blur over a whole 480 px picture).  So a decoder for a small device
+may read version 1 only: it refuses a version 2 file cleanly, and an encoder asked for version 1 approximates or drops
+what version 2 would have said (and says so).
 
 ## 3. Shapes
 
@@ -78,6 +82,19 @@ A shape is filled first, then stroked.
   indices follow. Otherwise `n` stops (1 … 8) of a byte offset (0 … 255 for 0 … 1) and a varuint colour index each,
   offsets not decreasing. Outside the stops the end colours extend (pad).
 - Gradients are interpolated in premultiplied sRGB.
+- **Version 2: the extension.** Bit 6 of the stops byte set: one byte `x` follows it, before the stops (and before the
+  two colour indices of the bit-7 form): bits 0–1 the spread (0 pad, 1 reflect, 2 repeat; 3 is invalid), bit 2 a focal
+  circle, bit 3 an ellipse, bits 4–7: 0.  Then, in this order: with bit 2 - zvar fx, zvar fy (absolute, grid units),
+  varuint fr (the focal radius, in the measure of r); with bit 3 - varuint ry (the second radius, grid units), zvar
+  rotation in degrees (of the axis of r).  Bits 2 and 3 are for radial gradients only.  The stops' count is then
+  `n & 0x3F` (bit 7 keeps its meaning).
+  - *Spread:* t outside 0 … 1 is brought into it - pad clamps, repeat takes the fraction, reflect folds every other
+    period back.
+  - *Ellipse:* the gradient's circle of radius r about (cx, cy) is the ellipse of radii r and ry, its first axis
+    turned by the rotation.
+  - *Focal circle:* t at a point is the largest t for which the circle of centre f + t (c − f) and radius
+    fr + t (r − fr) passes through it (SVG 2's two-point gradient, inside the ellipse's space); a focal point outside
+    the circle is moved onto its edge, as SVG 1.1 does.
 
 ### 3.2 Paths
 
@@ -104,6 +121,45 @@ operands: in command order
 - Arcs follow SVG's endpoint parametrisation (SVG 1.1 F.6.5), including the scaling of radii that do not reach.
 - A fill closes every subpath implicitly.
 
+### 3.3 Version 2's records
+
+A kind byte with bit 6 set (0x40 … 0x7F) is a record of version 2 (bit 7 set is invalid in both versions):
+
+| Kind | Record | Fields |
+|---|---|---|
+| 0x40 | group begin | below |
+| 0x41 | group end | none |
+| 0x42 | dashes | u8 n (1 … 8, even), n × varuint length (grid units: dash, gap, dash, …), zvar offset (grid units) - for the stroke of the next shape only |
+
+Any other is invalid.  **A group:**
+
+| Field | Size | Meaning |
+|---|---|---|
+| flags | 1 B | bit 0 opacity, bit 1 clip, bit 2 the clip's rule even-odd (else non-zero), bit 3 shadows, bit 4 blur; bits 5–7: 0 |
+| length | varuint | the bytes of the body: everything after this header up to and including its group end |
+| box | zvar x0, zvar y0, varuint w, varuint h | what the body draws, grid units (absolute): the layers' size; no pixel outside it belongs to the group |
+| opacity | u8 | with bit 0: 0 … 255 for 0 … 1 |
+| shadows | u8 n (1 … 4), then n × (zvar dx, zvar dy, varuint sigma - grid units; varuint colour index) | with bit 3 |
+| blur | varuint sigma, grid units | with bit 4 |
+| clip | a path (3.2) | with bit 1, the pen carried as in a shape |
+| body | records | shapes, dashes and groups (6 deep at most), then 0x41 |
+
+How a group is drawn - the order is SVG's (the filter, then the clip, then the opacity):
+
+1. **Shadows and glows** (bit 3) first, under everything the group draws: the body's alpha (its coverage times its
+   paints' alpha) moved by (dx, dy), blurred by a Gaussian of sigma, times the shadow's colour, laid in their order.
+   A glow is a shadow with no offset.  A decoder may draw the body twice for this (once for the alpha, once for real),
+   so a shadow needs only an 8-bit layer on any target; the pen and the arc's radii go through the body the same way
+   both times.
+2. **The body**, through the clip (bit 1: the clip path's coverage under its rule, intersected with the clips around
+   it) - as one layer when opacity (bit 0) or blur (bit 4) is given: the layer blurred by a Gaussian of sigma, then laid
+   over what lies below at the group's opacity.  Without a layer the body draws straight onto the target.
+
+A shape in a group may not take "the previous shape's path" (kind bit 5) from outside the group; the first shape after a
+group gives its own path too.  Sigma and the offsets go through the drawing's matrix (a Gaussian of sigma × the
+matrix's mean scale in device pixels).  An approximation of the Gaussian is the renderer's choice (the reference: three
+box blurs).
+
 ## 4. Rendering rules
 
 - Coverage: the exact area of the shape inside each pixel (anti-aliasing is part of the format's look).
@@ -128,8 +184,9 @@ As a URI: `data:image/x-mcuvg;base64,…`. File extension: `.mcuvg`.
 
 A conforming decoder:
 
-- reads only within the given length and refuses a picture that ends early or holds an unknown command, paint,
-  version or a non-zero reserved bit;
+- reads only within the given length and refuses a picture that ends early or holds an unknown command, paint, record,
+  version or a non-zero reserved bit; a group's body must be exactly its length;
+- may read version 1 only (and refuse version 2), or both;
 - may read the data with aligned word loads only (so it can be executed from XIP flash or ROM in place);
 - draws nothing of a shape it cannot complete.
 
@@ -140,8 +197,9 @@ A conforming decoder:
 - **Text and markers.** A converter turns them into ordinary shapes (glyph outlines, copies of the marker at the
   vertices); the format and the decoder know neither.
 - **Images, masks, patterns.**
-- **Clipping, filters (blur, glow, shadows), exact group opacity, dashes** - version 2 (2.2). In version 1 a
-  group's opacity is approximated by multiplying the alpha of each shape, and a dashed stroke is solid.
+- **Filters other than blur, shadows and glows** (inner shadows, lighting, turbulence, colour matrices, blend modes).
+  Clipping, blur, shadows, glows, exact group opacity and dashes are version 2's (2.2); a picture written as version 1
+  approximates group opacity by multiplying the alpha of each shape and draws dashes solid.
 
 A converter reports whatever it drops or simplifies.
 

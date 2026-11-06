@@ -639,6 +639,7 @@ def decode(b):
                 width = r.vu() / k
                 sb = r.u8()
                 cap, join, miter = CAP_N.get(sb & 3, "butt"), JOIN_N.get(sb >> 2 & 3, "miter"), 1 + (sb >> 4) / 2
+            assert not (kind & 32 and st["last"] is None), "the previous path taken where there is none"
             segs = st["last"] if kind & 32 else path()
             st["last"] = segs
             sh = {"segs": segs, "fill": fill, "stroke": stroke, "width": width, "cap": cap, "join": join,

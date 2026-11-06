@@ -311,7 +311,6 @@ static int group(struct dec *d, mcuvg_ctx *c)
     if (blen < 1u || end > d->r.len || end < start) return MCUVG_E_ARG;
     int32_t spx = d->px, spy = d->py, sarot = d->arot;
     uint32_t sar = d->ar, sary = d->ary;
-    int shp = d->have_path;
     d->depth++;
     for (int pass = (g.nshadow ? 1 : 2); pass <= 2; pass++) {
         int rc = pass == 1 ? mcuvg_shadow_begin(c, &g) : mcuvg_group_begin(c, &g);
@@ -329,13 +328,15 @@ static int group(struct dec *d, mcuvg_ctx *c)
                 return rc;
             }
         }
-        d->r.i = start; d->px = spx; d->py = spy; d->ar = sar; d->ary = sary; d->arot = sarot; d->have_path = shp;
+        d->r.i = start; d->px = spx; d->py = spy; d->ar = sar; d->ary = sary; d->arot = sarot;
+        d->have_path = 0;                            /* no "previous path" across a group's edge (SPEC.md 3.3) */
         rc = body(d, c, 1);
         if (!rc && d->r.i != end) rc = MCUVG_E_ARG;  /* the body is exactly its length */
         int rc2 = pass == 1 ? mcuvg_shadow_end(c) : mcuvg_group_end(c);
         if (rc || rc2) { d->depth--; return rc ? rc : rc2; }
     }
     d->depth--;
+    d->have_path = 0;
     return MCUVG_OK;
 }
 
